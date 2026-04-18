@@ -1,0 +1,80 @@
+// Title: AI Extensions Usage Detection (Browser and IDE Extensions)
+//
+// Description:
+// Detects creation or modification of browser and IDE extension files associated
+// with AI-enabled tools such as GitHub Copilot, ChatGPT, Gemini, Grammarly,
+// Codeium, Cody, Continue, and similar assistants.
+//
+// This detection helps identify adoption of AI-assisted tooling that may be
+// unapproved, unmanaged, or outside enterprise policy.
+//
+// Platform:
+// Microsoft Defender XDR / Advanced Hunting
+//
+// Data Source:
+// DeviceFileEvents
+//
+// ATT&CK Mapping:
+// - Tactic: Persistence (contextual)
+// - Technique: T1176 - Browser Extensions
+//
+// Why this matters:
+// AI extensions can provide direct access to external generative AI services from
+// browsers and development environments, increasing the risk of:
+// - Source code exposure
+// - Sensitive data leakage
+// - Unapproved AI-assisted development
+//
+// Notes:
+// - This rule detects extension-related file activity, not confirmed usage
+// - Best used as a visibility and hygiene detection
+// - Follow-up investigation should validate whether the extension is installed,
+//   active, and approved for enterprise use
+
+let timeframe = 24h;
+
+let ai_extension_keywords = dynamic([
+    "chatgpt",
+    "copilot",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "grammarly",
+    "codeium",
+    "tabnine",
+    "cody",
+    "continue"
+]);
+
+DeviceFileEvents
+| where TimeGenerated > ago(timeframe)
+| where ActionType in~ ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has_any (
+    "\\Extensions\\",
+    "\\.vscode\\extensions\\",
+    "\\.vscode-insiders\\extensions\\",
+    "\\JetBrains\\",
+    "\\Cursor\\"
+)
+| where FileName has_any (ai_extension_keywords)
+    or FolderPath has_any (ai_extension_keywords)
+| project
+    TimeGenerated,
+    DeviceName,
+    InitiatingProcessAccountName,
+    ActionType,
+    FileName,
+    FolderPath,
+    SHA1,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    ReportId
+| summarize
+    EventCount = count(),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    Files = make_set(FileName, 20),
+    Paths = make_set(FolderPath, 20)
+    by DeviceName, InitiatingProcessAccountName, ActionType
+| order by EventCount desc
