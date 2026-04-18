@@ -1,1 +1,64 @@
+// Title: Network-based Shadow AI Usage Detection
+// Description:
+// Detects outbound network activity from common web browsers to AI-related services
+// such as ChatGPT, Copilot, Gemini, Anthropic, xAI, DeepSeek, and Grammarly.
+// This detection helps identify unauthorized or unapproved AI usage in enterprise environments.
+//
+// Platform:
+// Microsoft Defender XDR / Advanced Hunting
+//
+// Data Source:
+// DeviceNetworkEvents
+//
+// ATT&CK Mapping:
+// - Tactic: Command and Control
+// - Technique: T1071 - Application Layer Protocol
+//
+// Why this matters:
+// Users may interact with external AI services through browsers and transmit sensitive
+// business data, source code, client information, or internal documents without approval.
+//
+// Notes:
+// - This rule is intended as an initial visibility detection.
+// - In environments with approved AI tooling, tuning is strongly recommended.
+// - This query focuses on browser-driven traffic for higher signal quality.
 
+let timeframe = 1h;
+
+let ai_domains = dynamic([
+    "openai.com",
+    "chatgpt.com",
+    "copilot.microsoft.com",
+    "anthropic.com",
+    "claude.ai",
+    "x.ai",
+    "deepseek.com",
+    "generativelanguage.googleapis.com",
+    "gemini.google.com",
+    "grammarly.com"
+]);
+
+DeviceNetworkEvents
+| where TimeGenerated > ago(timeframe)
+| where InitiatingProcessFileName in~ ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe")
+| where isnotempty(RemoteUrl)
+| where RemoteUrl has_any (ai_domains)
+| project
+    TimeGenerated,
+    DeviceName,
+    InitiatingProcessAccountName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    RemoteUrl,
+    RemoteIP,
+    RemotePort,
+    Protocol,
+    ReportId
+| summarize
+    ConnectionCount = count(),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    RemoteUrls = make_set(RemoteUrl, 20),
+    RemoteIPs = make_set(RemoteIP, 20)
+    by DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName
+| order by ConnectionCount desc
