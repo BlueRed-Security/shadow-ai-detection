@@ -1,0 +1,78 @@
+// Title: Local LLM Usage Detection (Ollama, GGUF, llama.cpp, LM Studio)
+//
+// Description:
+// Detects execution of local Large Language Models (LLMs) and related tooling
+// such as Ollama, llama.cpp, LM Studio, and other GGUF-based models.
+//
+// This detection helps identify unauthorized local AI usage that may introduce:
+// - Data leakage risks
+// - Unmonitored AI processing
+// - Shadow AI adoption outside approved tooling
+//
+// Platform:
+// Microsoft Defender XDR / Advanced Hunting
+//
+// Data Source:
+// DeviceProcessEvents
+//
+// ATT&CK Mapping:
+// - Tactic: Execution
+// - Technique: T1059 - Command and Scripting Interpreter (contextual)
+//
+// Why this matters:
+// Local LLMs operate outside of centralized control and may process sensitive
+// enterprise data without visibility from security teams.
+//
+// Notes:
+// - High-value detection for identifying offline AI usage
+// - Low noise in most enterprise environments
+// - Should be investigated carefully when triggered
+
+let timeframe = 24h;
+
+DeviceProcessEvents
+| where TimeGenerated > ago(timeframe)
+| where
+    FileName in~ (
+        "ollama.exe",
+        "lmstudio.exe",
+        "jan.exe",
+        "anythingllm.exe",
+        "node.exe"
+    )
+    or ProcessCommandLine has_any (
+        "ollama run",
+        "ollama serve",
+        "llama.cpp",
+        ".gguf",
+        "lmstudio",
+        "anythingllm",
+        "jan.ai"
+    )
+| where not(
+    ProcessCommandLine has_any (
+        "visual studio",
+        "msbuild",
+        "azureml",
+        "python train",
+        "pip install"
+    )
+)
+| project
+    TimeGenerated,
+    DeviceName,
+    InitiatingProcessAccountName,
+    FileName,
+    ProcessCommandLine,
+    FolderPath,
+    SHA1,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    ReportId
+| summarize
+    ExecutionCount = count(),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    Commands = make_set(ProcessCommandLine, 20)
+    by DeviceName, InitiatingProcessAccountName, FileName
+| order by ExecutionCount desc
