@@ -75,3 +75,50 @@ https://uaeblueredsecurity.com/
 ## License
 
 MIT License
+
+
+### Use Case: Shadow AI Risk
+
+Organizations are increasingly exposed to **Shadow AI** — the use of AI tools outside approved processes and visibility.
+
+This includes:
+- Employees using ChatGPT or Gemini for internal data
+- Developers leveraging Copilot or AI assistants without governance
+- Local LLMs processing sensitive data offline (Ollama, GGUF models)
+- AI extensions integrated directly into browsers and IDEs
+
+Without proper detection, organizations lack visibility into:
+- What data is being shared
+- Which tools are being used
+- Who is interacting with AI systems
+
+---
+
+## Business Impact
+
+Uncontrolled AI usage can lead to:
+
+- **Data leakage** (source code, credentials, internal documents)
+- **Compliance risks** (GDPR, data residency violations)
+- **Intellectual property exposure**
+- **Loss of auditability and visibility**
+- **Policy violations without enforcement**
+
+Most organizations currently have:
+ No visibility  
+ No detection  
+ No control  
+
+---
+
+## What You Get in a Proof of Value (PoC)
+
+If you want to go beyond basic visibility, a PoC engagement includes:
+
+- Deployment of tailored Shadow AI detections
+- 3–5 production-ready detection rules
+- Initial tuning based on your environment
+- Identification of detection gaps
+- Actionable insights on AI usage in your organization
+
+ Learn more: https://uaeblueredsecurity.com/services/proof-of-value-poc/
