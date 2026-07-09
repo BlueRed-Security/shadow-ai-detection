@@ -1,0 +1,99 @@
+// =============================================================================
+// AI-002: Local LLM Execution and Model File Activity
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     2.0.0
+// Platform:    Microsoft Defender XDR (Advanced Hunting)
+// Tables:      DeviceProcessEvents, DeviceFileEvents
+// Sentinel:    See AI-002-local-llm-execution.yaml for the scheduled
+//              analytics rule version (uses TimeGenerated instead of Timestamp)
+// MITRE:       T1204 (User Execution, contextual mapping for unsanctioned
+//              software), TA0002 Execution
+// =============================================================================
+//
+// PURPOSE
+// Detects execution of local LLM runtimes (Ollama, LM Studio, llama.cpp, Jan,
+// GPT4All, KoboldCpp and others) and the writing of local model files (GGUF,
+// GGML, llamafile) to disk. Local LLMs process data entirely offline: no
+// proxy, no CASB, no API logs. A user can feed an entire customer database or
+// source tree into a local model and no network control will ever see it.
+//
+// SIGNAL DESIGN
+// Two independent signals, unioned:
+//   1. Process execution: known LLM runtime binaries or command lines
+//      containing LLM tooling indicators.
+//   2. Model file activity: GGUF/GGML/llamafile files written to disk,
+//      which catches model downloads even when the runtime is renamed.
+//
+// HOW TO USE
+// 1. Run over 7 days to baseline. Expect hits from legitimate ML engineers
+//    and developers. Build your exclusion list from device groups, not users.
+// 2. Deploy on a 1h to 24h schedule depending on your environment size.
+// 3. A renamed binary still writes model files, and a model file without a
+//    known runtime still shows up. Investigate the pair together.
+//
+// =============================================================================
+
+let lookback = 24h;
+// --- Known local LLM runtime binaries ----------------------------------------
+let llm_process_names = dynamic([
+    "ollama.exe", "ollama app.exe",
+    "lm studio.exe", "lmstudio.exe", "lms.exe",
+    "jan.exe", "gpt4all.exe", "koboldcpp.exe",
+    "llama-server.exe", "llama-cli.exe", "llamafile.exe",
+    "anythingllm.exe", "msty.exe"
+]);
+// --- Command line indicators (catch renamed or scripted runtimes) -----------
+let llm_cmdline_indicators = dynamic([
+    "ollama run", "ollama serve", "ollama pull",
+    "llama.cpp", "llama-cpp", "node-llama-cpp",
+    ".gguf", ".ggml",
+    "koboldcpp", "text-generation-webui", "open-webui",
+    "gpt4all", "localai", "llamafile",
+    "lmstudio", "lm-studio",
+    "vllm serve", "mlx_lm"
+]);
+// --- Tuning: legitimate development activity to exclude ----------------------
+let cmdline_exclusions = dynamic([
+    "msbuild", "visual studio",
+    "\\azureml\\", "winget install", "choco install"
+]);
+// Signal 1: LLM runtime execution
+let ProcessSignal = DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where FileName in~ (llm_process_names)
+    or ProcessCommandLine has_any (llm_cmdline_indicators)
+| where not(ProcessCommandLine has_any (cmdline_exclusions))
+| extend
+    Signal = "LLM runtime execution",
+    Detail = ProcessCommandLine,
+    User = coalesce(AccountUpn, AccountName)
+| project Timestamp, DeviceName, User, Signal, Detail, FileName, FolderPath, SHA256, ReportId;
+// Signal 2: local model files written to disk
+let ModelFileSignal = DeviceFileEvents
+| where Timestamp > ago(lookback)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".gguf"
+    or FileName endswith ".ggml"
+    or FileName endswith ".llamafile"
+| extend
+    Signal = "LLM model file written",
+    Detail = strcat(FolderPath, " | ", tostring(FileSize), " bytes | via ", InitiatingProcessFileName),
+    User = InitiatingProcessAccountUpn
+| project Timestamp, DeviceName, User, Signal, Detail, FileName, FolderPath, SHA256, ReportId;
+union ProcessSignal, ModelFileSignal
+| summarize
+    EventCount = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    Signals = make_set(Signal, 2),
+    Details = make_set(Detail, 15),
+    Files = make_set(FileName, 15),
+    ReportIds = make_set(ReportId, 5)
+    by DeviceName, User
+| order by EventCount desc
+// =============================================================================
+// OUTPUT: one row per user per device with both signal types merged. A device
+// showing both "LLM runtime execution" and "LLM model file written" is a
+// confirmed local LLM setup, not a stray file.
+// =============================================================================

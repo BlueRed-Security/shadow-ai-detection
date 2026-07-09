@@ -1,0 +1,123 @@
+id: f11c0cf5-0d32-401c-ab75-45e1d02035c7
+name: AI-002 - Local LLM Execution and Model File Activity
+description: |
+  Detects execution of local LLM runtimes (Ollama, LM Studio, llama.cpp, Jan,
+  GPT4All, KoboldCpp and others) and the writing of local model files (GGUF,
+  GGML, llamafile) to disk on corporate endpoints.
+
+  Local LLMs process data entirely offline: no proxy, no CASB, no API audit
+  logs. A user can feed customer databases or full source trees into a local
+  model with zero network visibility. Local model tooling also appears in
+  offensive tradecraft, where attackers use offline models to generate
+  payloads and phishing content without touching monitored cloud AI services.
+
+  The rule combines two signals: known runtime execution (including command
+  line indicators that survive binary renaming) and model file writes, which
+  catch model downloads even when the runtime itself is disguised.
+severity: Medium
+status: Available
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceProcessEvents
+      - DeviceFileEvents
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Execution
+relevantTechniques:
+  - T1204
+query: |
+  let llm_process_names = dynamic([
+      "ollama.exe", "ollama app.exe",
+      "lm studio.exe", "lmstudio.exe", "lms.exe",
+      "jan.exe", "gpt4all.exe", "koboldcpp.exe",
+      "llama-server.exe", "llama-cli.exe", "llamafile.exe",
+      "anythingllm.exe", "msty.exe"
+  ]);
+  let llm_cmdline_indicators = dynamic([
+      "ollama run", "ollama serve", "ollama pull",
+      "llama.cpp", "llama-cpp", "node-llama-cpp",
+      ".gguf", ".ggml",
+      "koboldcpp", "text-generation-webui", "open-webui",
+      "gpt4all", "localai", "llamafile",
+      "lmstudio", "lm-studio",
+      "vllm serve", "mlx_lm"
+  ]);
+  let cmdline_exclusions = dynamic([
+      "msbuild", "visual studio",
+      "\\azureml\\", "winget install", "choco install"
+  ]);
+  let ProcessSignal = DeviceProcessEvents
+  | where FileName in~ (llm_process_names)
+      or ProcessCommandLine has_any (llm_cmdline_indicators)
+  | where not(ProcessCommandLine has_any (cmdline_exclusions))
+  | extend
+      Signal = "LLM runtime execution",
+      Detail = ProcessCommandLine,
+      User = coalesce(AccountUpn, AccountName)
+  | project TimeGenerated, DeviceName, User, Signal, Detail, FileName, FolderPath;
+  let ModelFileSignal = DeviceFileEvents
+  | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+  | where FileName endswith ".gguf"
+      or FileName endswith ".ggml"
+      or FileName endswith ".llamafile"
+  | extend
+      Signal = "LLM model file written",
+      Detail = strcat(FolderPath, " | ", tostring(FileSize), " bytes | via ", InitiatingProcessFileName),
+      User = InitiatingProcessAccountUpn
+  | project TimeGenerated, DeviceName, User, Signal, Detail, FileName, FolderPath;
+  union ProcessSignal, ModelFileSignal
+  | summarize
+      EventCount = count(),
+      FirstSeen = min(TimeGenerated),
+      LastSeen = max(TimeGenerated),
+      Signals = make_set(Signal, 2),
+      Details = make_set(Detail, 15),
+      Files = make_set(FileName, 15)
+      by DeviceName, User
+  | extend SignalCount = array_length(Signals)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: User
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: DeviceName
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-002: Local LLM activity on {{DeviceName}} by {{User}}'
+  alertDescriptionFormat: 'User {{User}} on device {{DeviceName}} generated {{EventCount}} local LLM events. Signals: {{Signals}}. Files: {{Files}}'
+customDetails:
+  Signals: Signals
+  Details: Details
+  Files: Files
+  EventCount: EventCount
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 5h
+    matchingMethod: Selected
+    groupByEntities:
+      - Host
+kind: Scheduled
+version: 2.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Others
