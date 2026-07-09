@@ -1,0 +1,113 @@
+id: c073d561-4a97-4296-82f0-a004f3b30ec3
+name: AI-001 - Unapproved Generative AI Service Usage from Corporate Endpoints
+description: |
+  Detects browser-driven connections from corporate endpoints to generative AI
+  services (ChatGPT, Claude, Gemini, DeepSeek, Perplexity and others) that are
+  not on the organization's approved AI tool list.
+
+  Unapproved AI usage creates data exfiltration, intellectual property and
+  compliance risk: employees may paste source code, credentials, customer data
+  or internal documents into external AI services with no organizational
+  visibility or contractual data protection.
+
+  Recommended tuning: maintain the approved AI tools list in the
+  'ApprovedAITools' watchlist (or edit the inline approved_ai_domains list) so
+  the rule only fires on tools outside policy.
+severity: Medium
+status: Available
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceNetworkEvents
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Exfiltration
+  - CommandAndControl
+relevantTechniques:
+  - T1567
+  - T1071.001
+query: |
+  let approved_ai_domains = dynamic([
+      "copilot.microsoft.com"
+  ]);
+  // Optional: replace the inline list above with a Sentinel watchlist:
+  // let approved_ai_domains = toscalar(
+  //     _GetWatchlist('ApprovedAITools') | summarize make_list(Domain));
+  let browser_processes = dynamic([
+      "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+      "opera.exe", "vivaldi.exe", "arc.exe", "safari"
+  ]);
+  let genai_domains = dynamic([
+      "chatgpt.com", "openai.com", "oaiusercontent.com",
+      "claude.ai", "claude.com", "anthropic.com",
+      "gemini.google.com", "aistudio.google.com", "notebooklm.google.com",
+      "copilot.microsoft.com",
+      "chat.mistral.ai", "mistral.ai",
+      "grok.com", "x.ai",
+      "chat.deepseek.com", "deepseek.com",
+      "meta.ai", "pi.ai", "you.com", "poe.com", "perplexity.ai",
+      "huggingface.co", "groq.com", "chat.qwen.ai", "kimi.com",
+      "character.ai",
+      "grammarly.com", "jasper.ai", "copy.ai",
+      "v0.dev", "replit.com", "lovable.dev", "bolt.new"
+  ]);
+  DeviceNetworkEvents
+  | where ActionType in ("ConnectionSuccess", "ConnectionRequest", "HttpConnectionInspected")
+  | where InitiatingProcessFileName in~ (browser_processes)
+  | where isnotempty(RemoteUrl)
+  | where RemoteUrl has_any (genai_domains)
+  | where not(RemoteUrl has_any (approved_ai_domains))
+  | extend AIService = tostring(parse_url(iff(RemoteUrl startswith "http", RemoteUrl, strcat("https://", RemoteUrl))).Host)
+  | extend AIService = iff(isempty(AIService), RemoteUrl, AIService)
+  | summarize
+      ConnectionCount = count(),
+      FirstSeen = min(TimeGenerated),
+      LastSeen = max(TimeGenerated),
+      AIServices = make_set(AIService, 25),
+      SampleUrls = make_set(RemoteUrl, 10)
+      by DeviceName, InitiatingProcessAccountUpn, InitiatingProcessAccountName
+  | extend DistinctServiceCount = array_length(AIServices)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: InitiatingProcessAccountUpn
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: DeviceName
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-001: {{InitiatingProcessAccountUpn}} used {{DistinctServiceCount}} unapproved AI service(s)'
+  alertDescriptionFormat: 'User {{InitiatingProcessAccountUpn}} on device {{DeviceName}} connected {{ConnectionCount}} times to unapproved generative AI services: {{AIServices}}'
+customDetails:
+  AIServices: AIServices
+  ConnectionCount: ConnectionCount
+  SampleUrls: SampleUrls
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 5h
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+kind: Scheduled
+version: 2.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Others

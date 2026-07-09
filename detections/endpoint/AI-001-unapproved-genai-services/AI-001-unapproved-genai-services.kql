@@ -1,0 +1,89 @@
+// =============================================================================
+// AI-001: Unapproved Generative AI Service Usage from Corporate Endpoints
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     2.0.0
+// Platform:    Microsoft Defender XDR (Advanced Hunting)
+// Table:       DeviceNetworkEvents
+// Sentinel:    See AI-001-unapproved-genai-services.yaml for the scheduled
+//              analytics rule version (uses TimeGenerated instead of Timestamp)
+// MITRE:       T1567 (Exfiltration Over Web Service), T1071.001 (Web Protocols)
+// =============================================================================
+//
+// PURPOSE
+// Detects browser-driven connections from corporate endpoints to generative AI
+// services that are not on the organization's approved list. Focusing on
+// browser processes keeps the signal clean: it captures interactive employee
+// usage rather than background SDK or update traffic.
+//
+// HOW TO USE
+// 1. Review the approved_ai_domains list and add every AI tool your
+//    organization has sanctioned (for example Copilot with commercial data
+//    protection). Approved domains are excluded from results.
+// 2. Run over 7 days first to baseline usage, then deploy on a 1h schedule.
+// 3. Investigate per user and domain, not per connection. One user hitting
+//    an unapproved AI service 200 times is a different conversation than
+//    one connection from a marketing laptop.
+//
+// =============================================================================
+
+let lookback = 1h;
+// --- Approved AI tools: EDIT THIS to match your organization's policy -------
+let approved_ai_domains = dynamic([
+    "copilot.microsoft.com"        // example: M365 Copilot approved tenant-wide
+]);
+// --- Monitored browser processes ---------------------------------------------
+let browser_processes = dynamic([
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "opera.exe", "vivaldi.exe", "arc.exe", "safari"
+]);
+// --- Generative AI service domains, grouped by category ---------------------
+let genai_domains = dynamic([
+    // General purpose chat assistants
+    "chatgpt.com", "openai.com", "oaiusercontent.com",
+    "claude.ai", "claude.com", "anthropic.com",
+    "gemini.google.com", "aistudio.google.com", "notebooklm.google.com",
+    "copilot.microsoft.com",
+    "chat.mistral.ai", "mistral.ai",
+    "grok.com", "x.ai",
+    "chat.deepseek.com", "deepseek.com",
+    "meta.ai",
+    "pi.ai",
+    "you.com",
+    "poe.com",
+    "perplexity.ai",
+    // Model hubs and hosted inference
+    "huggingface.co", "groq.com",
+    "chat.qwen.ai", "kimi.com",
+    // Character and companion AI
+    "character.ai",
+    // AI writing and productivity assistants
+    "grammarly.com", "notion.so/product/ai", "jasper.ai", "copy.ai",
+    // AI coding assistants (web)
+    "v0.dev", "replit.com", "lovable.dev", "bolt.new"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(lookback)
+| where ActionType in ("ConnectionSuccess", "ConnectionRequest", "HttpConnectionInspected")
+| where InitiatingProcessFileName in~ (browser_processes)
+| where isnotempty(RemoteUrl)
+| where RemoteUrl has_any (genai_domains)
+| where not(RemoteUrl has_any (approved_ai_domains))
+// Extract the registrable domain for clean per-service aggregation
+| extend AIService = tostring(parse_url(iff(RemoteUrl startswith "http", RemoteUrl, strcat("https://", RemoteUrl))).Host)
+| extend AIService = iff(isempty(AIService), RemoteUrl, AIService)
+| summarize
+    ConnectionCount = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    AIServices = make_set(AIService, 25),
+    SampleUrls = make_set(RemoteUrl, 10),
+    Browsers = make_set(InitiatingProcessFileName, 5),
+    ReportIds = make_set(ReportId, 5)
+    by DeviceName, InitiatingProcessAccountUpn, InitiatingProcessAccountName
+| extend DistinctServiceCount = array_length(AIServices)
+| order by ConnectionCount desc
+// =============================================================================
+// OUTPUT: one row per user per device, with every unapproved AI service they
+// touched in the window, connection volume, and sample URLs for triage.
+// =============================================================================
