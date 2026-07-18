@@ -1,0 +1,111 @@
+id: 5221fec0-d785-4e5c-8309-9c9cf133a302
+name: AI-005 - Non-Browser AI API Traffic from Corporate Endpoints
+description: |
+  The mirror of AI-001. AI-001 scopes to browsers to catch interactive employee
+  usage; AI-005 scopes to everything except browsers to catch the programmatic
+  channel: scripts, SDKs, CLI tools, agents and custom apps calling AI provider
+  APIs directly (api.openai.com, api.anthropic.com, Azure OpenAI, AWS Bedrock
+  and others).
+
+  API traffic is where automated, high-volume data movement lives: a job piping
+  a customer table through an LLM, a script summarizing internal documents, an
+  unsanctioned AI agent with broad tool access. None of it touches a browser, so
+  AI-001 never sees it.
+
+  Recommended tuning: add sanctioned AI API integrations (e.g. an approved Azure
+  OpenAI resource host) to approved_ai_api_domains, and exclude dev/CI device
+  groups rather than individual users.
+severity: Medium
+status: Available
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceNetworkEvents
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Exfiltration
+  - CommandAndControl
+relevantTechniques:
+  - T1567
+  - T1071.001
+query: |
+  let approved_ai_api_domains = dynamic([
+      // "mycompany-openai.openai.azure.com"  // example: approved Azure OpenAI resource
+  ]);
+  let browser_processes = dynamic([
+      "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+      "opera.exe", "vivaldi.exe", "arc.exe", "safari", "iexplore.exe"
+  ]);
+  let ai_api_domains = dynamic([
+      "api.openai.com", "api.anthropic.com",
+      "generativelanguage.googleapis.com", "aiplatform.googleapis.com",
+      "api.mistral.ai", "api.cohere.ai", "api.cohere.com",
+      "api.perplexity.ai", "api.deepseek.com", "api.x.ai",
+      "api.groq.com", "api.together.xyz", "api.fireworks.ai",
+      "api-inference.huggingface.co", "api.replicate.com",
+      "api.stability.ai", "api.elevenlabs.io",
+      "openai.azure.com", "bedrock-runtime", "bedrock-agent-runtime"
+  ]);
+  DeviceNetworkEvents
+  | where ActionType in ("ConnectionSuccess", "ConnectionRequest", "HttpConnectionInspected")
+  | where isnotempty(RemoteUrl)
+  | where RemoteUrl has_any (ai_api_domains)
+  | where not(RemoteUrl has_any (approved_ai_api_domains))
+  | where InitiatingProcessFileName !in~ (browser_processes)
+  | extend AIEndpoint = tostring(parse_url(iff(RemoteUrl startswith "http", RemoteUrl, strcat("https://", RemoteUrl))).Host)
+  | extend AIEndpoint = iff(isempty(AIEndpoint), RemoteUrl, AIEndpoint)
+  | summarize
+      ConnectionCount = count(),
+      FirstSeen = min(TimeGenerated),
+      LastSeen = max(TimeGenerated),
+      AIEndpoints = make_set(AIEndpoint, 25),
+      Processes = make_set(InitiatingProcessFileName, 15),
+      CommandLines = make_set(InitiatingProcessCommandLine, 10),
+      SampleUrls = make_set(RemoteUrl, 10)
+      by DeviceName, InitiatingProcessAccountUpn, InitiatingProcessAccountName
+  | extend DistinctProcessCount = array_length(Processes)
+  | extend DistinctEndpointCount = array_length(AIEndpoints)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: InitiatingProcessAccountUpn
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: DeviceName
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-005: {{InitiatingProcessAccountUpn}} ran non-browser AI API traffic to {{DistinctEndpointCount}} endpoint(s)'
+  alertDescriptionFormat: 'On device {{DeviceName}}, non-browser process(es) {{Processes}} made {{ConnectionCount}} connection(s) to AI provider APIs: {{AIEndpoints}}. Review for automated/scripted data movement.'
+customDetails:
+  AIEndpoints: AIEndpoints
+  Processes: Processes
+  ConnectionCount: ConnectionCount
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 5h
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+kind: Scheduled
+version: 1.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Others
