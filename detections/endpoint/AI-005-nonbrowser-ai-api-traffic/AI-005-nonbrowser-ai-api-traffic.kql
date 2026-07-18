@@ -1,0 +1,94 @@
+// =============================================================================
+// AI-005: Non-Browser AI API Traffic from Corporate Endpoints
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     1.0.0
+// Platform:    Microsoft Defender XDR (Advanced Hunting)
+// Table:       DeviceNetworkEvents
+// Sentinel:    See AI-005-nonbrowser-ai-api-traffic.yaml for the scheduled
+//              analytics rule version (uses TimeGenerated instead of Timestamp)
+// MITRE:       T1567 (Exfiltration Over Web Service), T1071.001 (Web Protocols)
+// =============================================================================
+//
+// PURPOSE
+// The mirror image of AI-001. AI-001 scopes to browsers to catch interactive
+// employee usage. AI-005 scopes to EVERYTHING EXCEPT browsers to catch the
+// programmatic channel: scripts, SDKs, CLI tools, agents and custom apps
+// calling AI provider APIs directly (api.openai.com, api.anthropic.com, Azure
+// OpenAI, AWS Bedrock and more). Together the two rules cover the full picture;
+// separately, each stays clean.
+//
+// WHY IT IS A DIFFERENT DETECTION
+// API traffic is where automated data movement lives: a nightly job piping a
+// customer table through an LLM, a developer script summarizing internal
+// documents, an unsanctioned "AI agent" with broad tool access. None of it
+// touches a browser, so AI-001 never sees it. This is also where scale lives:
+// one script can send far more data than a human ever pastes.
+//
+// HOW TO USE
+// 1. Add every SANCTIONED AI API integration to approved_ai_api_domains (for
+//    example your approved Azure OpenAI resource host) so it stops firing.
+// 2. Baseline over 7 days. Expect hits from dev machines and CI runners; build
+//    exclusions by device group, not by user.
+// 3. Deploy on a 1h schedule. Investigate per user/device and process, not per
+//    connection.
+//
+// NOTE ON COVERAGE
+// RemoteUrl for non-browser TLS depends on the endpoint seeing SNI/DNS. Most
+// AI API calls use HTTPS with SNI, so coverage is good, but a hardcoded-IP
+// client can slip through. Pair with egress proxy logs where you have them.
+//
+// =============================================================================
+
+let lookback = 1h;
+// --- Sanctioned AI API endpoints: EDIT THIS (e.g. your Azure OpenAI host) ----
+let approved_ai_api_domains = dynamic([
+    // "mycompany-openai.openai.azure.com"  // example: approved Azure OpenAI resource
+]);
+// --- Browsers are covered by AI-001; exclude them here -----------------------
+let browser_processes = dynamic([
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "opera.exe", "vivaldi.exe", "arc.exe", "safari", "iexplore.exe"
+]);
+// --- AI provider API endpoints (host substrings) -----------------------------
+let ai_api_domains = dynamic([
+    // Major LLM provider APIs
+    "api.openai.com", "api.anthropic.com",
+    "generativelanguage.googleapis.com", "aiplatform.googleapis.com",
+    "api.mistral.ai", "api.cohere.ai", "api.cohere.com",
+    "api.perplexity.ai", "api.deepseek.com", "api.x.ai",
+    "api.groq.com", "api.together.xyz", "api.fireworks.ai",
+    // Hosted inference and model hubs
+    "api-inference.huggingface.co", "api.replicate.com",
+    "api.stability.ai", "api.elevenlabs.io",
+    // Enterprise cloud AI (custom subdomains match by substring)
+    "openai.azure.com", "bedrock-runtime", "bedrock-agent-runtime"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(lookback)
+| where ActionType in ("ConnectionSuccess", "ConnectionRequest", "HttpConnectionInspected")
+| where isnotempty(RemoteUrl)
+| where RemoteUrl has_any (ai_api_domains)
+| where not(RemoteUrl has_any (approved_ai_api_domains))
+| where InitiatingProcessFileName !in~ (browser_processes)
+| extend AIEndpoint = tostring(parse_url(iff(RemoteUrl startswith "http", RemoteUrl, strcat("https://", RemoteUrl))).Host)
+| extend AIEndpoint = iff(isempty(AIEndpoint), RemoteUrl, AIEndpoint)
+| summarize
+    ConnectionCount = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    AIEndpoints = make_set(AIEndpoint, 25),
+    Processes = make_set(InitiatingProcessFileName, 15),
+    CommandLines = make_set(InitiatingProcessCommandLine, 10),
+    SampleUrls = make_set(RemoteUrl, 10),
+    ReportIds = make_set(ReportId, 5)
+    by DeviceName, InitiatingProcessAccountUpn, InitiatingProcessAccountName
+| extend DistinctProcessCount = array_length(Processes)
+| extend DistinctEndpointCount = array_length(AIEndpoints)
+| order by ConnectionCount desc
+// =============================================================================
+// OUTPUT: one row per user per device, listing the non-browser processes that
+// called AI APIs, the endpoints hit, connection volume and command lines for
+// triage. A scripting host (python.exe, node.exe, powershell.exe, curl.exe)
+// hitting an LLM API in volume is the signal that matters most.
+// =============================================================================
