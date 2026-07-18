@@ -1,0 +1,106 @@
+id: 75c7df2a-5710-45a3-b43e-805c277dd3ff
+name: AI-004 - Sensitive Data Uploaded to Generative AI Services
+description: |
+  Detects files uploaded from corporate identities into generative AI services
+  (ChatGPT, Claude, Gemini, Perplexity and others). AI-001 shows who is talking
+  to AI; this rule shows who is sending FILES to AI, which is a data-loss event:
+  a contract, source tree or customer export uploaded into a consumer AI tier
+  has no DLP coverage and no contractual protection.
+
+  Telemetry note: raw endpoint network tables cannot measure upload volume or
+  content, so this rule reads CloudAppEvents (Microsoft Defender for Cloud Apps).
+  It requires Defender for Cloud Apps, or an equivalent CASB/DLP feeding upload
+  actions with the destination app. Without it, use the endpoint correlation
+  fallback documented in the README (lower confidence).
+
+  Recommended tuning: run the discovery query in the README to align the app
+  names and upload ActionType values with what appears in your tenant.
+severity: High
+status: Available
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - CloudAppEvents
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Exfiltration
+relevantTechniques:
+  - T1567
+query: |
+  let genai_apps = dynamic([
+      "ChatGPT", "OpenAI", "Anthropic", "Claude",
+      "Google Gemini", "Google Bard", "Gemini",
+      "Perplexity", "DeepSeek", "Mistral AI", "Mistral",
+      "Hugging Face", "Poe", "Character.AI", "Grammarly",
+      "Copilot", "Microsoft Copilot"
+  ]);
+  let genai_domains = dynamic([
+      "chatgpt.com", "openai.com", "claude.ai", "anthropic.com",
+      "gemini.google.com", "perplexity.ai", "deepseek.com",
+      "mistral.ai", "huggingface.co", "poe.com", "character.ai"
+  ]);
+  let upload_actions = dynamic([
+      "FileUploaded", "FileUpload", "Upload", "FileUploadedToCloud",
+      "EntityUploaded", "Put", "MessageAttachmentUploaded"
+  ]);
+  CloudAppEvents
+  | where ActionType has_any (upload_actions)
+  | where Application has_any (genai_apps)
+      or tostring(RawEventData) has_any (genai_domains)
+  | extend
+      FileName = tostring(coalesce(ObjectName, tostring(RawEventData.ObjectName))),
+      User = tostring(coalesce(AccountDisplayName, AccountObjectId)),
+      App = Application
+  | summarize
+      UploadCount = count(),
+      FirstSeen = min(TimeGenerated),
+      LastSeen = max(TimeGenerated),
+      Apps = make_set(App, 10),
+      Files = make_set(FileName, 25),
+      Actions = make_set(ActionType, 10),
+      SourceIPs = make_set(IPAddress, 10),
+      DeviceTypes = make_set(DeviceType, 5)
+      by User, AccountObjectId
+  | extend DistinctFileCount = array_length(Files)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: User
+      - identifier: AadUserId
+        columnName: AccountObjectId
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-004: {{User}} uploaded {{DistinctFileCount}} file(s) to generative AI'
+  alertDescriptionFormat: 'User {{User}} uploaded {{UploadCount}} file(s) to generative AI service(s) {{Apps}}. Files: {{Files}}. Review for sensitive data exposure.'
+customDetails:
+  Apps: Apps
+  Files: Files
+  UploadCount: UploadCount
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 5h
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+kind: Scheduled
+version: 1.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Others
