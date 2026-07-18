@@ -1,0 +1,113 @@
+// =============================================================================
+// AI-004: Sensitive Data Uploaded to Generative AI Services
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     1.0.0
+// Platform:    Microsoft Defender XDR (Advanced Hunting)
+// Tables:      CloudAppEvents (primary), DeviceNetworkEvents + DeviceFileEvents
+//              (endpoint fallback, see commented block)
+// Sentinel:    See AI-004-sensitive-data-to-genai.yaml for the scheduled
+//              analytics rule version (uses TimeGenerated instead of Timestamp)
+// MITRE:       T1567 (Exfiltration Over Web Service)
+// =============================================================================
+//
+// PURPOSE
+// Detects files uploaded from corporate identities into generative AI services.
+// AI-001 answers "who is talking to AI"; this answers the harder question,
+// "who is sending FILES to AI". A pasted paragraph is a policy issue; a whole
+// contract, source tree or customer export uploaded into a consumer AI tier is
+// a data-loss event with no DLP coverage and no contractual protection.
+//
+// TELEMETRY NOTE (read before deploying)
+// Raw endpoint network tables cannot measure upload volume or file content, so
+// this detection needs one of:
+//   - Microsoft Defender for Cloud Apps (populates CloudAppEvents with file
+//     upload actions and the destination app). This is the PRIMARY query below.
+//   - Microsoft Purview Endpoint DLP (egress activity with destination), or a
+//     CASB/proxy doing DLP on GenAI domains.
+// Without one of those, use the ENDPOINT FALLBACK block at the bottom, which
+// correlates a GenAI browser session with sensitive-file access in the same
+// window. It is lower confidence (staging inference, not a confirmed upload).
+//
+// HOW TO USE
+// 1. Confirm Defender for Cloud Apps is streaming CloudAppEvents.
+// 2. Run the discovery query in the README to find the exact upload ActionType
+//    strings and GenAI app names in YOUR tenant, then align the lists below.
+// 3. Baseline over 7 days, then deploy on a 1h to 4h schedule.
+//
+// =============================================================================
+
+let lookback = 24h;
+// --- GenAI apps as they appear in Defender for Cloud Apps (Application) ------
+let genai_apps = dynamic([
+    "ChatGPT", "OpenAI", "Anthropic", "Claude",
+    "Google Gemini", "Google Bard", "Gemini",
+    "Perplexity", "DeepSeek", "Mistral AI", "Mistral",
+    "Hugging Face", "Poe", "Character.AI", "Grammarly",
+    "Copilot", "Microsoft Copilot"
+]);
+// --- GenAI hostnames, for tenants where the app resolves only by URL --------
+let genai_domains = dynamic([
+    "chatgpt.com", "openai.com", "claude.ai", "anthropic.com",
+    "gemini.google.com", "perplexity.ai", "deepseek.com",
+    "mistral.ai", "huggingface.co", "poe.com", "character.ai"
+]);
+// --- Upload-style actions (values vary by connected/discovered app) ----------
+let upload_actions = dynamic([
+    "FileUploaded", "FileUpload", "Upload", "FileUploadedToCloud",
+    "EntityUploaded", "Put", "MessageAttachmentUploaded"
+]);
+CloudAppEvents
+| where Timestamp > ago(lookback)
+| where ActionType has_any (upload_actions)
+| where Application has_any (genai_apps)
+    or tostring(RawEventData) has_any (genai_domains)
+| extend
+    FileName = tostring(coalesce(ObjectName, tostring(RawEventData.ObjectName))),
+    User = tostring(coalesce(AccountDisplayName, AccountObjectId)),
+    App = Application
+| summarize
+    UploadCount = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    Apps = make_set(App, 10),
+    Files = make_set(FileName, 25),
+    Actions = make_set(ActionType, 10),
+    SourceIPs = make_set(IPAddress, 10),
+    DeviceTypes = make_set(DeviceType, 5),
+    ReportIds = make_set(ReportId, 5)
+    by User, AccountObjectId
+| extend DistinctFileCount = array_length(Files)
+| order by UploadCount desc
+// =============================================================================
+// OUTPUT: one row per user, listing every file sent to a GenAI app in the
+// window, upload volume and source IPs. Prioritize rows with many distinct
+// files or file names that look like exports, dumps or documents.
+// =============================================================================
+//
+// -----------------------------------------------------------------------------
+// ENDPOINT FALLBACK (no Defender for Cloud Apps / DLP available)
+// Lower confidence: it does not confirm an upload, it flags a GenAI browser
+// session that coincides with sensitive-file access by the same user. Uncomment
+// and run separately. Tune sensitive_paths / sensitive_ext to your environment.
+// -----------------------------------------------------------------------------
+// let win = 30m;
+// let sensitive_ext = dynamic([".sql",".bak",".csv",".xlsx",".pst",".zip",".pem",".key",".env",".docx",".pdf"]);
+// let browser_processes = dynamic(["chrome.exe","msedge.exe","firefox.exe","brave.exe","opera.exe","vivaldi.exe","arc.exe"]);
+// let genai_sessions = DeviceNetworkEvents
+//     | where Timestamp > ago(lookback)
+//     | where InitiatingProcessFileName in~ (browser_processes)
+//     | where RemoteUrl has_any (genai_domains)
+//     | project SessionTime = Timestamp, DeviceName, User = InitiatingProcessAccountUpn, RemoteUrl;
+// let file_touch = DeviceFileEvents
+//     | where Timestamp > ago(lookback)
+//     | where ActionType in ("FileCreated","FileModified","FileRenamed")
+//     | where FileName has_any (sensitive_ext)
+//     | project FileTime = Timestamp, DeviceName, User = InitiatingProcessAccountUpn, FileName, FolderPath;
+// genai_sessions
+// | join kind=inner file_touch on DeviceName, User
+// | where abs(datetime_diff('second', SessionTime, FileTime)) <= toint(win / 1s)
+// | summarize Sessions=dcount(RemoteUrl), Files=make_set(FileName,25), FirstSeen=min(FileTime), LastSeen=max(FileTime)
+//     by DeviceName, User
+// | order by array_length(Files) desc
+// =============================================================================
