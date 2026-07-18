@@ -1,0 +1,103 @@
+// =============================================================================
+// AI-003: Unmanaged AI Browser Extensions and IDE Plugins
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     1.0.0
+// Platform:    Microsoft Defender XDR (Advanced Hunting)
+// Tables:      DeviceFileEvents, DeviceRegistryEvents
+// Sentinel:    See AI-003-ai-browser-extensions.yaml for the scheduled
+//              analytics rule version (uses TimeGenerated instead of Timestamp)
+// MITRE:       T1176 (Browser Extensions)
+// =============================================================================
+//
+// PURPOSE
+// Detects installation of browser extensions that most app-control policies
+// wave through as ordinary browser activity. AI assistants (Grammarly, Monica,
+// Merlin, Sider, "ChatGPT for Google" and dozens more) install as extensions
+// and send page content, selected text or clipboard data to a third-party
+// model, functionally the same exposure as a chatbot but invisible to tools
+// that only watch standalone AI domains.
+//
+// SIGNAL DESIGN
+// Two independent signals, unioned:
+//   1. Local install: an extension manifest.json written under a browser
+//      Extensions directory. The 32-character extension ID is parsed from the
+//      folder path.
+//   2. Managed forcelist: extension IDs pushed via policy
+//      (ExtensionInstallForcelist / ExtensionSettings registry keys), which
+//      catches org-deployed AI extensions that never touch a user download.
+//
+// The rule uses an APPROVED-LIST model like AI-001: approved extension IDs are
+// excluded, everything else surfaces for review. A curated known-AI ID list
+// flags the high-confidence AI extensions so they sort to the top, but the
+// rule stays valuable before that list is fully populated because every
+// unapproved install is visible.
+//
+// HOW TO USE
+// 1. Populate approved_extension_ids with the extensions your org sanctions.
+// 2. Extend known_ai_extension_ids from Chrome Web Store / Edge Add-ons
+//    research (see README for how to harvest IDs). Grammarly is seeded as a
+//    verified example.
+// 3. Run over 7 days first to baseline installs, then deploy on a 12h to 24h
+//    schedule. Investigate per user and extension ID, not per file event.
+//
+// =============================================================================
+
+let lookback = 24h;
+// --- Approved extensions: EDIT THIS. Chrome/Edge 32-char IDs (chars a-p) -----
+let approved_extension_ids = dynamic([
+    // "ghbmnnjooekpmoecnnnilnnbdlolhkhi"  // example: Google Docs Offline
+]);
+// --- Known AI extensions: flags high-confidence hits. EXTEND from research ---
+let known_ai_extension_ids = dynamic([
+    "kbfnbcaeplbcioakkpcpgfkobkghlhen"   // Grammarly (verified example; add your own)
+]);
+// --- Browser profile roots that hold extension packages ----------------------
+let browser_ext_paths = dynamic([
+    @"\Google\Chrome\User Data\", @"\Microsoft\Edge\User Data\",
+    @"\BraveSoftware\", @"\Vivaldi\", @"\Opera Software\", @"\Mozilla\Firefox\"
+]);
+// Signal 1: local extension install (manifest written under an Extensions dir)
+let LocalInstall = DeviceFileEvents
+| where Timestamp > ago(lookback)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("manifest.json", "_metadata")
+| where FolderPath has @"\Extensions\"
+| where FolderPath has_any (browser_ext_paths)
+| extend ExtId = tostring(extract(@"\\Extensions\\([a-p]{32})", 1, FolderPath))
+| where isnotempty(ExtId)
+| extend Source = "Local install (manifest)",
+         Detail = FolderPath,
+         User = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName)
+| project Timestamp, DeviceName, User, ExtId, Source, Detail, Browser = InitiatingProcessFileName, ReportId;
+// Signal 2: managed / forcelist extension deployment via policy
+let Forcelist = DeviceRegistryEvents
+| where Timestamp > ago(lookback)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryKey has_any ("ExtensionInstallForcelist", "ExtensionSettings")
+| extend ExtId = tostring(extract(@"([a-p]{32})", 1, tostring(coalesce(RegistryValueData, RegistryValueName))))
+| where isnotempty(ExtId)
+| extend Source = "Managed forcelist",
+         Detail = RegistryKey,
+         User = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName),
+         Browser = "policy"
+| project Timestamp, DeviceName, User, ExtId, Source, Detail, Browser, ReportId;
+union LocalInstall, Forcelist
+| where not(ExtId in~ (approved_extension_ids))
+| extend IsKnownAI = ExtId in~ (known_ai_extension_ids)
+| summarize
+    EventCount = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    Sources = make_set(Source, 2),
+    Paths = make_set(Detail, 5),
+    Browsers = make_set(Browser, 4),
+    ReportIds = make_set(ReportId, 5)
+    by DeviceName, User, ExtId, IsKnownAI
+| extend ExtensionStoreUrl = strcat("https://chromewebstore.google.com/detail/", ExtId)
+| order by IsKnownAI desc, LastSeen desc
+// =============================================================================
+// OUTPUT: one row per user per device per extension ID. IsKnownAI = true means
+// the ID matched the curated AI list (triage first). Everything else is an
+// unapproved install to review. Open ExtensionStoreUrl to identify unknown IDs.
+// =============================================================================
