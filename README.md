@@ -1,124 +1,58 @@
 # shadow-ai-detection
-# Shadow AI Detection
 
-Detect unauthorized AI usage in your environment (ChatGPT, Copilot, Gemini, Ollama, local LLMs).
+Production-ready detections for **shadow AI** on Microsoft Sentinel and Defender XDR: the unsanctioned and unmonitored use of generative AI across corporate endpoints, identities and cloud apps. Every rule ships as a Defender XDR KQL query, a Sentinel analytics YAML, and a README with tuning and an investigation runbook.
 
-Modern organizations are increasingly exposed to **Shadow AI** - unapproved use of AI tools that can lead to:
-- Data exfiltration
-- Intellectual property leakage
-- Compliance violations
-- Loss of visibility and control
+Maintained by [BlueRed Security](https://uaeblueredsecurity.com/), a detection engineering practice for Microsoft Sentinel and Defender XDR.
 
-This repository provides **production-ready detection rules** to help security teams identify and monitor AI usage across enterprise environments.
+## Why shadow AI
 
----
+Employees adopt AI tools faster than security teams can govern them. The exposure is not one channel but several: browser sessions to consumer AI, local models that never touch the network, AI browser extensions that app-control waves through, and files uploaded straight into a consumer tier that trains on the input. Most AI governance programs have a policy but no telemetry. This repo is the telemetry.
 
-## Coverage
+## Detection catalog
 
-The detections in this repository focus on:
+| ID | Detection | Data source | ATT&CK | Status |
+|---|---|---|---|---|
+| [AI-001](detections/endpoint/AI-001-unapproved-genai-services/) | Unapproved generative AI service usage | `DeviceNetworkEvents` | T1567, T1071.001 | Published |
+| [AI-002](detections/endpoint/AI-002-local-llm-execution/) | Local LLM execution and model file activity | `DeviceProcessEvents`, `DeviceFileEvents` | T1204 | Published |
+| [AI-003](detections/endpoint/AI-003-ai-browser-extensions/) | Unmanaged AI browser extensions and IDE plugins | `DeviceFileEvents`, `DeviceRegistryEvents` | T1176 | Published |
+| [AI-004](detections/endpoint/AI-004-sensitive-data-to-genai/) | Sensitive data uploaded to generative AI | `CloudAppEvents` | T1567 | Published |
+| [AI-005](detections/endpoint/AI-005-nonbrowser-ai-api-traffic/) | Non-browser / API-based AI traffic | `DeviceNetworkEvents` | T1567, T1071.001 | Published |
 
-- Network-based AI usage (OpenAI, Anthropic, Google AI, Copilot)
-- Local LLM execution (Ollama, GGUF, llama.cpp, LM Studio)
-- AI-powered extensions (Copilot, ChatGPT, Grammarly, Codeium)
-- Suspicious AI-related processes and command-line activity
+AI-001 through AI-005 map the five core shadow-AI channels end to end: browser usage, local models, browser extensions, files uploaded to AI, and non-browser API traffic. More detections (AI-006 onward) are planned across the identity, cloud (Azure OpenAI) and exfiltration categories. The roadmap is deliberately paced so each rule ships production-ready rather than as a stub.
 
----
+## Repository layout
 
-## Supported Platforms
+```
+detections/
+  endpoint/      Endpoint-visible shadow AI (AI-001..AI-005)
+  identity/      Identity and access-driven AI risk (planned)
+  azure-openai/  Azure OpenAI / enterprise AI service abuse (planned)
+  exfiltration/  Data-out-to-AI patterns (planned)
+docs/            Deployment notes and shared references
+```
 
-- Microsoft Defender XDR
-- Microsoft Sentinel
+Each detection folder contains:
 
-All detections are written using **KQL (Kusto Query Language)**.
+- `<ID>-<slug>.kql`: Defender XDR Advanced Hunting query (uses `Timestamp`)
+- `<ID>-<slug>.yaml`: Microsoft Sentinel scheduled analytics rule (uses `TimeGenerated`)
+- `README.md`: what it detects, why it matters, prerequisites, deployment, tuning, investigation runbook, false positives
 
-## Repository Structure
+## How to deploy
 
-/kql
-network-ai-usage.kql
-local-llm-usage.kql
-ai-extensions.kql
+**Defender XDR (Advanced Hunting / Custom Detection):** paste the `.kql` into Advanced Hunting, run over `ago(7d)` to baseline, tune the inline lists, then save as a Custom Detection rule.
 
-/docs
-investigation-guide.md
-tuning-guide.md
+**Microsoft Sentinel:** import the `.yaml` via `Analytics > Import`, or deploy through your repository CI/CD. Entity mappings, alert details and incident grouping are already defined in each rule.
 
-## Investigation Guidance
+Read the per-detection README before deploying. Every rule needs environment-specific tuning (approved-tool lists, device-group exclusions, per-tenant action strings); the READMEs tell you exactly what to adjust.
 
-Each detection should be validated with:
-- User context (who executed the activity)
-- Process lineage
-- Network connections
-- Frequency and behavioral patterns
+## A note on tuning
 
-False positives are expected in developer-heavy environments and should be tuned accordingly.
+These rules are built to be honest about noise. Most start as **visibility** detections: the first week of results is the input to your actual AI usage policy, not a finished alert stream. Baseline first, tune with approved-lists and device groups, then raise severity where it matters. The tuning tables in each README exist so you are not deleting signal to silence noise.
 
----
+## About BlueRed Security
 
-## Important
+BlueRed Security builds and tunes production detection coverage for Microsoft Sentinel and Defender XDR: detection engineering sprints, continuous detection engineering, and proof-of-value engagements. If you want these detections deployed and tuned in your environment, or a broader detection program built around MITRE ATT&CK coverage, [start with a Proof of Value](https://uaeblueredsecurity.com/).
 
-These detections are designed as a **starting point**.  
-Proper tuning and correlation are required for production environments.
+## Disclaimer
 
----
-
-## Need help implementing this?
-
-If you want to:
-- Deploy and tune these detections
-- Identify real detection gaps in your environment
-- Reduce false positives and improve signal quality
-
-https://uaeblueredsecurity.com/
-
----
-
-## License
-
-MIT License
-
-
-### Use Case: Shadow AI Risk
-
-Organizations are increasingly exposed to **Shadow AI** — the use of AI tools outside approved processes and visibility.
-
-This includes:
-- Employees using ChatGPT or Gemini for internal data
-- Developers leveraging Copilot or AI assistants without governance
-- Local LLMs processing sensitive data offline (Ollama, GGUF models)
-- AI extensions integrated directly into browsers and IDEs
-
-Without proper detection, organizations lack visibility into:
-- What data is being shared
-- Which tools are being used
-- Who is interacting with AI systems
-
----
-
-## Business Impact
-
-Uncontrolled AI usage can lead to:
-
-- **Data leakage** (source code, credentials, internal documents)
-- **Compliance risks** (GDPR, data residency violations)
-- **Intellectual property exposure**
-- **Loss of auditability and visibility**
-- **Policy violations without enforcement**
-
-Most organizations currently have:
- No visibility  
- No detection  
- No control  
-
----
-
-## What You Get in a Proof of Value (PoC)
-
-If you want to go beyond basic visibility, a PoC engagement includes:
-
-- Deployment of tailored Shadow AI detections
-- 3–5 production-ready detection rules
-- Initial tuning based on your environment
-- Identification of detection gaps
-- Actionable insights on AI usage in your organization
-
- Learn more: https://uaeblueredsecurity.com/services/proof-of-value-poc/
+These detections are provided as-is for defensive security use. Validate and tune every rule in a test workspace before production deployment. KQL is illustrative of the detection logic and may need adjustment for your schema version and data connectors.
