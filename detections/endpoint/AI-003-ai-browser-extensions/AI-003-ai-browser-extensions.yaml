@@ -1,0 +1,117 @@
+id: ed229349-c702-44f0-9f5d-1b56b20dea90
+name: AI-003 - Unmanaged AI Browser Extensions and IDE Plugins
+description: |
+  Detects installation of browser extensions that app-control policies commonly
+  treat as ordinary browser activity. AI assistant extensions (Grammarly,
+  Monica, Merlin, Sider, "ChatGPT for Google" and similar) send page content,
+  selected text or clipboard data to third-party models, the same data exposure
+  as a standalone chatbot but invisible to controls that only watch AI domains.
+
+  Two signals are unioned: local installs (manifest.json written under a browser
+  Extensions directory) and managed forcelist deployments (extension IDs pushed
+  via ExtensionInstallForcelist / ExtensionSettings policy). An approved-list
+  model excludes sanctioned extension IDs; a curated known-AI ID list flags
+  high-confidence AI extensions for priority triage.
+
+  Recommended tuning: maintain approved_extension_ids for sanctioned tools and
+  extend known_ai_extension_ids from Chrome Web Store / Edge Add-ons research.
+severity: Medium
+status: Available
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceFileEvents
+      - DeviceRegistryEvents
+queryFrequency: 12h
+queryPeriod: 12h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Persistence
+relevantTechniques:
+  - T1176
+query: |
+  let approved_extension_ids = dynamic([
+      // "ghbmnnjooekpmoecnnnilnnbdlolhkhi"  // example: Google Docs Offline
+  ]);
+  let known_ai_extension_ids = dynamic([
+      "kbfnbcaeplbcioakkpcpgfkobkghlhen"   // Grammarly (verified example; add your own)
+  ]);
+  let browser_ext_paths = dynamic([
+      @"\Google\Chrome\User Data\", @"\Microsoft\Edge\User Data\",
+      @"\BraveSoftware\", @"\Vivaldi\", @"\Opera Software\", @"\Mozilla\Firefox\"
+  ]);
+  let LocalInstall = DeviceFileEvents
+  | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+  | where FileName in~ ("manifest.json", "_metadata")
+  | where FolderPath has @"\Extensions\"
+  | where FolderPath has_any (browser_ext_paths)
+  | extend ExtId = tostring(extract(@"\\Extensions\\([a-p]{32})", 1, FolderPath))
+  | where isnotempty(ExtId)
+  | extend Source = "Local install (manifest)",
+           Detail = FolderPath,
+           User = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName)
+  | project TimeGenerated, DeviceName, User, ExtId, Source, Detail, Browser = InitiatingProcessFileName, ReportId;
+  let Forcelist = DeviceRegistryEvents
+  | where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+  | where RegistryKey has_any ("ExtensionInstallForcelist", "ExtensionSettings")
+  | extend ExtId = tostring(extract(@"([a-p]{32})", 1, tostring(coalesce(RegistryValueData, RegistryValueName))))
+  | where isnotempty(ExtId)
+  | extend Source = "Managed forcelist",
+           Detail = RegistryKey,
+           User = coalesce(InitiatingProcessAccountUpn, InitiatingProcessAccountName),
+           Browser = "policy"
+  | project TimeGenerated, DeviceName, User, ExtId, Source, Detail, Browser, ReportId;
+  union LocalInstall, Forcelist
+  | where not(ExtId in~ (approved_extension_ids))
+  | extend IsKnownAI = ExtId in~ (known_ai_extension_ids)
+  | summarize
+      EventCount = count(),
+      FirstSeen = min(TimeGenerated),
+      LastSeen = max(TimeGenerated),
+      Sources = make_set(Source, 2),
+      Paths = make_set(Detail, 5),
+      Browsers = make_set(Browser, 4)
+      by DeviceName, User, ExtId, IsKnownAI
+  | extend ExtensionStoreUrl = strcat("https://chromewebstore.google.com/detail/", ExtId)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: User
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: DeviceName
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-003: {{User}} installed extension {{ExtId}} (known AI: {{IsKnownAI}})'
+  alertDescriptionFormat: 'User {{User}} on device {{DeviceName}} installed browser extension {{ExtId}} via {{Sources}}. Review whether this is a sanctioned tool.'
+customDetails:
+  ExtId: ExtId
+  IsKnownAI: IsKnownAI
+  Sources: Sources
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 24h
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+kind: Scheduled
+version: 1.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Others
