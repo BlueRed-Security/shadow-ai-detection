@@ -17,17 +17,22 @@ Employees adopt AI tools faster than security teams can govern them. The exposur
 | [AI-003](detections/endpoint/AI-003-ai-browser-extensions/) | Unmanaged AI browser extensions and IDE plugins | `DeviceFileEvents`, `DeviceRegistryEvents` | T1176 | Published |
 | [AI-004](detections/endpoint/AI-004-sensitive-data-to-genai/) | Sensitive data uploaded to generative AI | `CloudAppEvents` | T1567 | Published |
 | [AI-005](detections/endpoint/AI-005-nonbrowser-ai-api-traffic/) | Non-browser / API-based AI traffic | `DeviceNetworkEvents` | T1567, T1071.001 | Published |
+| [AI-006](detections/identity/AI-006-oauth-consent-ai-apps/) | OAuth consent to unsanctioned AI apps | `AuditLogs`, `CloudAppEvents` | T1528, T1098 | Published |
+| [AI-007](detections/identity/AI-007-ai-meeting-notetaker-bots/) | AI meeting notetaker and transcription bots | `OfficeActivity`, `CloudAppEvents` | T1213, T1114 | Published |
+| [AI-008](detections/azure-openai/AI-008-unsanctioned-azure-openai-provisioning/) | Unsanctioned Azure OpenAI provisioning | `AzureActivity` | T1578, T1583.006 | Published |
+| [AI-009](detections/azure-openai/AI-009-anomalous-azure-openai-consumption/) | Anomalous Azure OpenAI consumption | `AzureDiagnostics` | T1567, T1530 | Published |
+| [AI-010](detections/exfiltration/AI-010-download-then-genai-upload/) | Bulk download followed by GenAI upload | `CloudAppEvents` | T1567, T1074 | Published |
 
-AI-001 through AI-005 map the five core shadow-AI channels end to end: browser usage, local models, browser extensions, files uploaded to AI, and non-browser API traffic. More detections (AI-006 onward) are planned across the identity, cloud (Azure OpenAI) and exfiltration categories. The roadmap is deliberately paced so each rule ships production-ready rather than as a stub.
+AI-001 through AI-005 map the five core endpoint shadow-AI channels: browser usage, local models, browser extensions, files uploaded to AI, and non-browser API traffic. AI-006 through AI-010 extend the coverage into the identity, cloud (Azure OpenAI) and exfiltration layers: OAuth consent to AI apps, AI meeting notetaker bots, unsanctioned Azure OpenAI provisioning, anomalous Azure OpenAI consumption, and the bulk-download-then-AI-upload exfiltration chain. Together they cover shadow AI across endpoint, identity, cloud and data-egress. The roadmap is deliberately paced so each rule ships production-ready rather than as a stub.
 
 ## Repository layout
 
 ```
 detections/
   endpoint/      Endpoint-visible shadow AI (AI-001..AI-005)
-  identity/      Identity and access-driven AI risk (planned)
-  azure-openai/  Azure OpenAI / enterprise AI service abuse (planned)
-  exfiltration/  Data-out-to-AI patterns (planned)
+  identity/      Identity and access-driven AI risk (AI-006, AI-007)
+  azure-openai/  Azure OpenAI / enterprise AI service abuse (AI-008, AI-009)
+  exfiltration/  Data-out-to-AI patterns (AI-010)
 docs/            Deployment notes and shared references
 ```
 

@@ -1,0 +1,93 @@
+// =============================================================================
+// AI-008: Unsanctioned Azure OpenAI / Cognitive Services Provisioning
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     1.0.0
+// Platform:    Microsoft Sentinel / Log Analytics (interactive hunting)
+// Table:       AzureActivity (Azure Resource Manager control plane)
+// Sentinel:    See AI-008-unsanctioned-azure-openai-provisioning.yaml for the
+//              scheduled analytics rule version
+// MITRE:       T1578 (Modify Cloud Compute Infrastructure),
+//              T1583.006 (Acquire Infrastructure: Web Services)
+// =============================================================================
+//
+// PLATFORM NOTE
+// AzureActivity is an Azure control-plane table in Log Analytics / Sentinel, not
+// a Defender XDR Advanced Hunting table. This detection therefore ships as a
+// Sentinel hunting query (.kql) and a Sentinel analytics rule (.yaml); both use
+// TimeGenerated. There is no Defender XDR endpoint variant because provisioning
+// an Azure resource is a cloud control-plane action, not an endpoint event.
+//
+// PURPOSE
+// Detects the creation of Azure OpenAI and related Cognitive Services resources,
+// and model deployments on them, outside your approved subscriptions and
+// resource groups. This is "shadow AI infrastructure": an engineer or team
+// spins up their own Azure OpenAI resource, deploys GPT-class models, and starts
+// piping corporate data through an endpoint that security never inventoried, no
+// content filtering baseline, no diagnostic logging, no data-handling review.
+//
+// WHY IT MATTERS
+// Enterprise Azure OpenAI can be governed well, but only the resources you know
+// about. A resource created in an unmonitored subscription is a fully capable
+// LLM endpoint with your Azure identity behind it and none of the guardrails you
+// apply to the sanctioned one. It is also where a compromised or over-privileged
+// identity would stand up infrastructure for data staging or model abuse.
+//
+// HOW TO USE
+// 1. List your APPROVED subscription IDs and resource groups below. Everything
+//    else provisioning Cognitive Services / OpenAI is in scope.
+// 2. Baseline over 30 days to capture legitimate infra-as-code deployments and
+//    the service principals that run them.
+// 3. Deploy on a 1h schedule. A human caller creating an OpenAI account in an
+//    unapproved subscription is the priority result.
+//
+// =============================================================================
+
+let lookback = 1h;
+// --- APPROVED subscriptions where Azure OpenAI is governed: EDIT THIS ---------
+let approved_subscription_ids = dynamic([
+    // "00000000-0000-0000-0000-000000000000"  // example: approved AI platform sub
+]);
+// --- APPROVED resource groups (name match) for sanctioned AI infra -----------
+let approved_resource_groups = dynamic([
+    // "rg-ai-platform-prod"
+]);
+// --- Cognitive Services / OpenAI control-plane write operations ---------------
+let provisioning_ops = dynamic([
+    "MICROSOFT.COGNITIVESERVICES/ACCOUNTS/WRITE",
+    "MICROSOFT.COGNITIVESERVICES/ACCOUNTS/DEPLOYMENTS/WRITE",
+    "MICROSOFT.COGNITIVESERVICES/ACCOUNTS/DEPLOYMENTS/ACTION",
+    "MICROSOFT.MACHINELEARNINGSERVICES/WORKSPACES/WRITE",
+    "MICROSOFT.MACHINELEARNINGSERVICES/WORKSPACES/ONLINEENDPOINTS/WRITE"
+]);
+AzureActivity
+| where TimeGenerated > ago(lookback)
+| where ResourceProviderValue in~ ("MICROSOFT.COGNITIVESERVICES", "MICROSOFT.MACHINELEARNINGSERVICES")
+| where OperationNameValue has_any (provisioning_ops)
+| where ActivityStatusValue in~ ("Success", "Succeeded", "Accepted", "Started")
+| where SubscriptionId !in (approved_subscription_ids)
+| where ResourceGroup !in~ (approved_resource_groups)
+| extend ResourceKind = tostring(parse_json(tostring(Properties)).resource)
+| extend Caller = tostring(coalesce(Caller, tostring(parse_json(tostring(Claims)).name)))
+| extend IsHumanCaller = iff(Caller has "@", "Yes", "No")
+| extend TargetResource = tostring(coalesce(_ResourceId, Resource))
+| summarize
+    OperationCount = count(),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    Operations = make_set(OperationNameValue, 15),
+    Resources = make_set(TargetResource, 20),
+    ResourceGroups = make_set(ResourceGroup, 15),
+    Subscriptions = make_set(SubscriptionId, 15),
+    CallerIPs = make_set(CallerIpAddress, 10),
+    HumanCaller = make_set(IsHumanCaller, 3)
+    by Caller
+| extend DistinctResourceCount = array_length(Resources)
+| extend DistinctSubscriptionCount = array_length(Subscriptions)
+| order by OperationCount desc
+// =============================================================================
+// OUTPUT: one row per caller (user or service principal) that provisioned
+// Cognitive Services / OpenAI resources outside approved subscriptions and
+// resource groups. Prioritize HumanCaller = Yes creating new OpenAI ACCOUNTS
+// (not just IaC redeploys of known resources) in unfamiliar subscriptions.
+// =============================================================================

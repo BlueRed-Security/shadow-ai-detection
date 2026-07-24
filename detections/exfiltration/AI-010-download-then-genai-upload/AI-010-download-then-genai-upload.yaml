@@ -1,0 +1,141 @@
+id: bcd46483-ef63-4c4b-a25f-8b098d93d956
+name: AI-010 - Bulk Data Download Followed by Generative AI Upload
+description: |
+  Detects the exfiltration chain, not a single event: a user pulls a batch of
+  files from a corporate repository (SharePoint, OneDrive, Box, Google Drive, a
+  code host) and then, within a short window, uploads to a generative AI service.
+  Either half alone is routine. The sequence, bulk collection then AI upload, is
+  the pattern that turns using AI into moving corporate data into a consumer AI
+  tier.
+
+  Different from AI-004. AI-004 flags a single file uploaded to AI. AI-010 flags
+  the staging that precedes exfiltration: many files gathered, then pushed out.
+  Requiring a download burst plus an AI upload by the same identity in the same
+  window makes each hit far more likely to be real data movement than one person
+  pasting one document.
+
+  Telemetry note: needs Microsoft Defender for Cloud Apps streaming CloudAppEvents
+  with both download and upload actions. Run the discovery query in the README to
+  confirm the ActionType strings in your tenant, then set min_download_count above
+  normal per-user file activity.
+severity: High
+status: Available
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - CloudAppEvents
+queryFrequency: 1h
+queryPeriod: 4h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Exfiltration
+  - Collection
+relevantTechniques:
+  - T1567
+  - T1074
+  - T1213
+query: |
+  let lookback = 4h;
+  let correlation_window = 2h;
+  let min_download_count = 15;
+  let source_apps = dynamic([
+      "Microsoft SharePoint Online", "SharePoint", "Microsoft OneDrive for Business",
+      "OneDrive", "Box", "Dropbox", "Google Drive", "Egnyte",
+      "GitHub", "GitLab", "Azure DevOps", "Confluence"
+  ]);
+  let download_actions = dynamic([
+      "FileDownloaded", "FileSyncDownloaded", "FileDownloadedToCloud",
+      "Download", "FileAccessed", "EntityDownloaded", "Get"
+  ]);
+  let genai_apps = dynamic([
+      "ChatGPT", "OpenAI", "Anthropic", "Claude", "Google Gemini",
+      "Google Bard", "Gemini", "Perplexity", "DeepSeek", "Mistral AI",
+      "Mistral", "Hugging Face", "Poe", "Character.AI", "Copilot"
+  ]);
+  let genai_domains = dynamic([
+      "chatgpt.com", "openai.com", "claude.ai", "anthropic.com",
+      "gemini.google.com", "perplexity.ai", "deepseek.com",
+      "mistral.ai", "huggingface.co", "poe.com", "character.ai"
+  ]);
+  let upload_actions = dynamic([
+      "FileUploaded", "FileUpload", "Upload", "FileUploadedToCloud",
+      "EntityUploaded", "Put", "MessageAttachmentUploaded"
+  ]);
+  let downloads = CloudAppEvents
+      | where TimeGenerated > ago(lookback)
+      | where ActionType has_any (download_actions)
+      | where Application has_any (source_apps)
+      | extend User = tostring(coalesce(AccountDisplayName, AccountObjectId))
+      | extend DlFile = tostring(coalesce(ObjectName, tostring(RawEventData.ObjectName)))
+      | summarize
+          DownloadCount = count(),
+          DownloadStart = min(TimeGenerated),
+          DownloadEnd = max(TimeGenerated),
+          DownloadedFrom = make_set(Application, 10),
+          DownloadedFiles = make_set(DlFile, 30)
+          by User, AccountObjectId
+      | where DownloadCount >= min_download_count;
+  let ai_uploads = CloudAppEvents
+      | where TimeGenerated > ago(lookback)
+      | where ActionType has_any (upload_actions)
+      | where Application has_any (genai_apps) or tostring(RawEventData) has_any (genai_domains)
+      | extend User = tostring(coalesce(AccountDisplayName, AccountObjectId))
+      | extend UpFile = tostring(coalesce(ObjectName, tostring(RawEventData.ObjectName)))
+      | summarize
+          UploadCount = count(),
+          UploadStart = min(TimeGenerated),
+          UploadEnd = max(TimeGenerated),
+          UploadedTo = make_set(Application, 10),
+          UploadedFiles = make_set(UpFile, 30),
+          UploadIPs = make_set(IPAddress, 10)
+          by User, AccountObjectId;
+  downloads
+  | join kind=inner ai_uploads on User, AccountObjectId
+  | where UploadStart between (DownloadStart .. (DownloadEnd + correlation_window))
+  | extend MinutesFromBulkToUpload = round((UploadStart - DownloadEnd) / 1m, 1)
+  | project
+      User, AccountObjectId,
+      DownloadCount, DownloadedFrom, DownloadedFiles, DownloadStart, DownloadEnd,
+      UploadCount, UploadedTo, UploadedFiles, UploadStart, UploadIPs,
+      MinutesFromBulkToUpload
+  | order by DownloadCount desc, UploadCount desc
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: User
+      - identifier: AadUserId
+        columnName: AccountObjectId
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-010: {{User}} downloaded {{DownloadCount}} files then uploaded to AI {{UploadedTo}}'
+  alertDescriptionFormat: 'User {{User}} pulled {{DownloadCount}} file(s) from {{DownloadedFrom}} and uploaded to generative AI {{UploadedTo}} within {{MinutesFromBulkToUpload}} minutes. This is a bulk-collection-then-AI-upload sequence. Confirm file overlap and review as potential data exfiltration.'
+customDetails:
+  DownloadCount: DownloadCount
+  UploadedTo: UploadedTo
+  MinutesFromBulkToUpload: MinutesFromBulkToUpload
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 5h
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+kind: Scheduled
+version: 1.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Insider Risk

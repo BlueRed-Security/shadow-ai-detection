@@ -1,0 +1,115 @@
+id: e0d1f44d-ca8d-42d5-add2-27b6b545005a
+name: AI-007 - AI Meeting Notetaker and Transcription Bots in Microsoft 365
+description: |
+  Detects AI notetaker and transcription bots operating inside Microsoft 365:
+  Otter, Fireflies, Fathom, Read.ai, tl;dv, Fellow, Sembly, Avoma, Supernormal
+  and similar. These bots join Teams meetings as a participant, or connect via a
+  calendar/mailbox integration, and record, transcribe and store the audio and
+  text of internal conversations on a third-party consumer platform.
+
+  Different channel from AI-006. AI-006 catches the OAuth grant at consent time;
+  AI-007 catches the bot in operation, including cases where it rides in on an
+  EXTERNAL participant's invite (a vendor or candidate brings their own notetaker
+  into your meeting), which never touches your consent logs.
+
+  A full meeting transcript is often more sensitive than any single file:
+  unfiltered discussion of deals, roadmaps, personnel and incidents, verbatim,
+  stored and indexed by a third party, sometimes used to train their models.
+
+  Telemetry note: this Sentinel rule reads OfficeActivity (Microsoft 365 /
+  Teams audit). The Defender XDR KQL companion reads CloudAppEvents. Native
+  participant logging is uneven, so treat this as a visibility detection and
+  tune with the discovery query in the README before raising severity.
+severity: Medium
+status: Available
+requiredDataConnectors:
+  - connectorId: Office365
+    dataTypes:
+      - OfficeActivity (Teams)
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Collection
+relevantTechniques:
+  - T1213
+  - T1114
+query: |
+  let approved_notetakers = dynamic([
+      // "Microsoft 365 Copilot"  // example: approved first-party notetaker
+  ]);
+  let notetaker_names = dynamic([
+      "otter", "otter.ai", "fireflies", "fireflies.ai", "fathom",
+      "read.ai", "read ai", "readai", "tl;dv", "tldv", "fellow",
+      "fellow.app", "sembly", "avoma", "supernormal", "krisp",
+      "grain", "fathom notetaker", "notetaker", "note taker",
+      "ai notetaker", "meeting assistant", "meeting bot",
+      "transcription bot", "recorder bot", "sonix", "tactiq",
+      "colibri", "spinach", "vowel", "circleback", "jamie ai"
+  ]);
+  let bot_actions = dynamic([
+      "MeetingParticipantDetail", "BotAddedToTeam", "MemberAdded",
+      "AppInstalled", "TeamsAppInstalled", "BotAddedToConversation",
+      "MeetingParticipantJoined", "RecordingStarted", "TranscriptCreated",
+      "TranscriptDownloaded", "MeetingDetail"
+  ]);
+  OfficeActivity
+  | where OfficeWorkload in ("MicrosoftTeams", "Teams")
+  | where Operation has_any (bot_actions)
+      or isnotempty(Members) or isnotempty(AddOnName)
+  | extend ParticipantName = tostring(coalesce(AddOnName, Members, TargetUserOrGroupName, UserId))
+  | extend BlobToSearch = tolower(strcat(ParticipantName, " ", tostring(Members), " ", AddOnName, " ", Operation))
+  | where BlobToSearch has_any (notetaker_names)
+  | where not(BlobToSearch has_any (approved_notetakers))
+  | extend Organizer = tostring(coalesce(UserId, TargetUserOrGroupName))
+  | extend MeetingId = tostring(coalesce(CommunicationType, ChannelGuid, OfficeObjectId))
+  | extend BotName = tostring(ParticipantName)
+  | summarize
+      EventCount = count(),
+      FirstSeen = min(TimeGenerated),
+      LastSeen = max(TimeGenerated),
+      Bots = make_set(BotName, 15),
+      Operations = make_set(Operation, 15),
+      Meetings = make_set(MeetingId, 20),
+      SourceIPs = make_set(ClientIP, 10)
+      by Organizer
+  | extend DistinctBotCount = array_length(Bots)
+  | extend DistinctMeetingCount = array_length(Meetings)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Organizer
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-007: AI notetaker bot(s) {{Bots}} in meetings for {{Organizer}}'
+  alertDescriptionFormat: 'AI notetaker/transcription bot(s) {{Bots}} were seen across {{DistinctMeetingCount}} meeting(s) for organizer {{Organizer}} via operations {{Operations}}. Meeting content may be recorded and stored on a third-party platform. Review whether the bot is sanctioned.'
+customDetails:
+  Bots: Bots
+  Operations: Operations
+  MeetingCount: DistinctMeetingCount
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 5h
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+kind: Scheduled
+version: 1.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Insider Risk

@@ -1,0 +1,92 @@
+// =============================================================================
+// AI-009: Anomalous Azure OpenAI Consumption and Data-in-Prompt Exfiltration
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     1.0.0
+// Platform:    Microsoft Sentinel / Log Analytics (interactive hunting)
+// Table:       AzureDiagnostics (Azure OpenAI resource diagnostic logs)
+// Sentinel:    See AI-009-anomalous-azure-openai-consumption.yaml for the
+//              scheduled analytics rule version
+// MITRE:       T1567 (Exfiltration Over Web Service),
+//              T1530 (Data from Cloud Storage) when paired with bulk source reads
+// =============================================================================
+//
+// PLATFORM NOTE
+// Azure OpenAI diagnostic logs land in AzureDiagnostics (Log Analytics /
+// Sentinel), gated on diagnostic settings being enabled on the resource with the
+// RequestResponse and Audit categories. This is a Sentinel detection; there is
+// no Defender XDR endpoint variant. If diagnostics are off, this rule sees
+// nothing, which is exactly why AI-008 (provisioning) matters: you cannot
+// monitor usage on a resource you never brought under logging.
+//
+// PURPOSE
+// On the Azure OpenAI resources you DO govern, detect anomalous consumption that
+// looks like bulk data being pushed through the model: a caller whose request
+// volume spikes far above their own baseline, a new caller IP hitting the
+// resource, or high-volume access from an identity or location that has never
+// used it before. High-volume prompting is how you exfiltrate through an LLM:
+// feed it records, get "summaries" out, and the sensitive input rides in the
+// prompt where classic DLP does not inspect it.
+//
+// WHY IT MATTERS
+// A sanctioned Azure OpenAI resource is trusted egress by design, so it is an
+// attractive laundering point. A script that pushes a customer table through it
+// in a tight loop is indistinguishable from heavy legitimate use unless you
+// baseline per caller and alert on deviation. This rule provides that baseline.
+//
+// HOW TO USE
+// 1. Confirm diagnostic settings on each Azure OpenAI resource stream
+//    RequestResponse (and Audit) to this workspace.
+// 2. The query self-baselines over 7 days. Tune min_requests_current and
+//    spike_multiplier to your environment after observing a week of output.
+// 3. Deploy on a 1h schedule. Investigate spikes and first-seen caller IPs.
+//
+// =============================================================================
+
+let current_window = 1h;
+let baseline_window = 7d;
+// --- Minimum current-window request count to consider (noise floor) ----------
+let min_requests_current = 50;
+// --- How many times over baseline mean+stdev counts as a spike ---------------
+let spike_multiplier = 3.0;
+let aoai = AzureDiagnostics
+    | where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+    | where Category in ("RequestResponse", "Audit")
+    | extend Caller = tostring(coalesce(
+            column_ifexists("properties_s", ""),
+            CallerIPAddress))
+    | extend CallerIP = tostring(CallerIPAddress)
+    | extend ModelDeployment = tostring(parse_json(tostring(column_ifexists("properties_s", "{}"))).modelDeploymentName)
+    | extend AOAIResource = tostring(Resource);
+// --- Baseline: per resource+IP request stats over the prior 7 days -----------
+let baseline = aoai
+    | where TimeGenerated between (ago(baseline_window) .. ago(current_window))
+    | summarize BaseMean = avg(todouble(1)) , BaseCount = count() by AOAIResource, CallerIP
+    | extend HourlyBaseline = BaseCount / (7.0 * 24.0);
+// --- Current window volume per resource+IP -----------------------------------
+let current = aoai
+    | where TimeGenerated > ago(current_window)
+    | summarize
+        CurrentRequests = count(),
+        FirstSeen = min(TimeGenerated),
+        LastSeen = max(TimeGenerated),
+        Models = make_set(ModelDeployment, 15),
+        Operations = make_set(OperationName, 15)
+        by AOAIResource, CallerIP;
+current
+| join kind=leftouter baseline on AOAIResource, CallerIP
+| extend HourlyBaseline = coalesce(HourlyBaseline, 0.0)
+| extend IsNewCallerIP = iff(isnull(BaseCount) or BaseCount == 0, "Yes", "No")
+| extend SpikeRatio = iff(HourlyBaseline > 0, round(CurrentRequests / HourlyBaseline, 1), CurrentRequests * 1.0)
+| where CurrentRequests >= min_requests_current
+| where IsNewCallerIP == "Yes" or SpikeRatio >= spike_multiplier
+| project AOAIResource, CallerIP, CurrentRequests, HourlyBaseline = round(HourlyBaseline, 1),
+          SpikeRatio, IsNewCallerIP, Models, Operations, FirstSeen, LastSeen
+| order by SpikeRatio desc, CurrentRequests desc
+// =============================================================================
+// OUTPUT: one row per Azure OpenAI resource + caller IP whose current volume is
+// a large multiple of its 7-day baseline, or that has never called the resource
+// before. A brand new caller IP driving thousands of requests, or a known IP
+// spiking far above normal, is the signature of automated bulk data being run
+// through the model. Correlate with AI-010 and cloud storage reads to confirm.
+// =============================================================================

@@ -1,0 +1,114 @@
+id: 570d11d8-ecc3-4b77-bd3d-5289ba0ef9d0
+name: AI-009 - Anomalous Azure OpenAI Consumption and Data-in-Prompt Exfiltration
+description: |
+  On the Azure OpenAI resources you govern, detects anomalous consumption that
+  looks like bulk data being pushed through the model: a caller whose request
+  volume spikes far above its own 7-day baseline, or a new caller IP that has
+  never used the resource before. High-volume prompting is how you exfiltrate
+  through an LLM, feed it records, get summaries out, and the sensitive input
+  rides in the prompt where classic DLP does not inspect it.
+
+  A sanctioned Azure OpenAI resource is trusted egress by design, which makes it
+  an attractive laundering point. A script pushing a customer table through it in
+  a loop is indistinguishable from heavy legitimate use unless you baseline per
+  caller and alert on deviation. This rule provides that baseline.
+
+  Platform note: Azure OpenAI diagnostic logs land in AzureDiagnostics, gated on
+  diagnostic settings (RequestResponse and Audit categories) being enabled on the
+  resource. Sentinel only. If diagnostics are off the rule sees nothing, which is
+  why AI-008 (provisioning) matters: you cannot monitor usage on a resource you
+  never brought under logging.
+
+  Recommended tuning: after a week of output, adjust min_requests_current and
+  spike_multiplier to your environment.
+severity: Medium
+status: Available
+requiredDataConnectors:
+  - connectorId: AzureDiagnostics
+    dataTypes:
+      - AzureDiagnostics
+queryFrequency: 1h
+queryPeriod: 8d
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Exfiltration
+relevantTechniques:
+  - T1567
+  - T1530
+query: |
+  let current_window = 1h;
+  let baseline_window = 7d;
+  let min_requests_current = 50;
+  let spike_multiplier = 3.0;
+  let aoai = AzureDiagnostics
+      | where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+      | where Category in ("RequestResponse", "Audit")
+      | extend CallerIP = tostring(CallerIPAddress)
+      | extend ModelDeployment = tostring(parse_json(tostring(column_ifexists("properties_s", "{}"))).modelDeploymentName)
+      | extend AOAIResource = tostring(Resource);
+  let baseline = aoai
+      | where TimeGenerated between (ago(baseline_window) .. ago(current_window))
+      | summarize BaseCount = count() by AOAIResource, CallerIP
+      | extend HourlyBaseline = BaseCount / (7.0 * 24.0);
+  let current = aoai
+      | where TimeGenerated > ago(current_window)
+      | summarize
+          CurrentRequests = count(),
+          FirstSeen = min(TimeGenerated),
+          LastSeen = max(TimeGenerated),
+          Models = make_set(ModelDeployment, 15),
+          Operations = make_set(OperationName, 15)
+          by AOAIResource, CallerIP;
+  current
+  | join kind=leftouter baseline on AOAIResource, CallerIP
+  | extend HourlyBaseline = coalesce(HourlyBaseline, 0.0)
+  | extend IsNewCallerIP = iff(isnull(BaseCount) or BaseCount == 0, "Yes", "No")
+  | extend SpikeRatio = iff(HourlyBaseline > 0, round(CurrentRequests / HourlyBaseline, 1), CurrentRequests * 1.0)
+  | where CurrentRequests >= min_requests_current
+  | where IsNewCallerIP == "Yes" or SpikeRatio >= spike_multiplier
+  | project AOAIResource, CallerIP, CurrentRequests, HourlyBaseline = round(HourlyBaseline, 1),
+            SpikeRatio, IsNewCallerIP, Models, Operations, FirstSeen, LastSeen
+  | order by SpikeRatio desc, CurrentRequests desc
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: CallerIP
+  - entityType: AzureResource
+    fieldMappings:
+      - identifier: ResourceId
+        columnName: AOAIResource
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-009: Anomalous Azure OpenAI usage from {{CallerIP}} ({{CurrentRequests}} req, x{{SpikeRatio}} baseline)'
+  alertDescriptionFormat: 'Caller IP {{CallerIP}} made {{CurrentRequests}} request(s) to Azure OpenAI resource {{AOAIResource}} against an hourly baseline of {{HourlyBaseline}} (spike ratio {{SpikeRatio}}). New caller IP: {{IsNewCallerIP}}. Models: {{Models}}. Review for bulk data-in-prompt exfiltration.'
+customDetails:
+  CurrentRequests: CurrentRequests
+  SpikeRatio: SpikeRatio
+  IsNewCallerIP: IsNewCallerIP
+  Models: Models
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 5h
+    matchingMethod: Selected
+    groupByEntities:
+      - IP
+kind: Scheduled
+version: 1.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Cloud

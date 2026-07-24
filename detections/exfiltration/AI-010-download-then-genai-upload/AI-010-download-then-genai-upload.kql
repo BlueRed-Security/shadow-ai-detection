@@ -1,0 +1,113 @@
+// =============================================================================
+// AI-010: Bulk Data Download Followed by Generative AI Upload
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     1.0.0
+// Platform:    Microsoft Defender XDR (Advanced Hunting)
+// Table:       CloudAppEvents (Microsoft Defender for Cloud Apps)
+// Sentinel:    See AI-010-download-then-genai-upload.yaml for the scheduled
+//              analytics rule version (uses TimeGenerated instead of Timestamp)
+// MITRE:       T1567 (Exfiltration Over Web Service),
+//              T1074 (Data Staged), T1213 (Data from Information Repositories)
+// =============================================================================
+//
+// PURPOSE
+// Detects the exfiltration CHAIN, not a single event: a user pulls a batch of
+// files from a corporate repository (SharePoint, OneDrive, Box, Google Drive,
+// a code host) and then, within a short window, uploads to a generative AI
+// service. Either half alone is routine. The sequence, bulk collection then AI
+// upload, is the pattern that turns "using AI" into "moving corporate data into
+// a consumer AI tier".
+//
+// WHY IT IS A DIFFERENT DETECTION
+// AI-004 flags a single upload of a file to AI. AI-010 flags the STAGING that
+// precedes exfiltration: many files gathered, then pushed out. It raises the bar
+// for a match (a burst of downloads plus an AI upload by the same identity in
+// the same window), which makes each hit far more likely to be real data
+// movement rather than one person pasting one document.
+//
+// HOW TO USE
+// 1. Requires Microsoft Defender for Cloud Apps streaming CloudAppEvents with
+//    both download and upload actions. Run the README discovery query to confirm
+//    the ActionType strings in your tenant.
+// 2. Set min_download_count to a level above normal per-user file activity.
+// 3. Baseline over 7 to 14 days, then deploy on a 1h schedule.
+//
+// =============================================================================
+
+let lookback = 4h;
+let correlation_window = 2h;   // AI upload must follow the download burst within this window
+let min_download_count = 15;   // how many downloads counts as "bulk" (TUNE)
+// --- Repositories that count as a corporate data source ----------------------
+let source_apps = dynamic([
+    "Microsoft SharePoint Online", "SharePoint", "Microsoft OneDrive for Business",
+    "OneDrive", "Box", "Dropbox", "Google Drive", "Egnyte",
+    "GitHub", "GitLab", "Azure DevOps", "Confluence"
+]);
+let download_actions = dynamic([
+    "FileDownloaded", "FileSyncDownloaded", "FileDownloadedToCloud",
+    "Download", "FileAccessed", "EntityDownloaded", "Get"
+]);
+// --- GenAI destinations (aligned with AI-004) --------------------------------
+let genai_apps = dynamic([
+    "ChatGPT", "OpenAI", "Anthropic", "Claude", "Google Gemini",
+    "Google Bard", "Gemini", "Perplexity", "DeepSeek", "Mistral AI",
+    "Mistral", "Hugging Face", "Poe", "Character.AI", "Copilot"
+]);
+let genai_domains = dynamic([
+    "chatgpt.com", "openai.com", "claude.ai", "anthropic.com",
+    "gemini.google.com", "perplexity.ai", "deepseek.com",
+    "mistral.ai", "huggingface.co", "poe.com", "character.ai"
+]);
+let upload_actions = dynamic([
+    "FileUploaded", "FileUpload", "Upload", "FileUploadedToCloud",
+    "EntityUploaded", "Put", "MessageAttachmentUploaded"
+]);
+// --- Bulk download bursts per user -------------------------------------------
+let downloads = CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType has_any (download_actions)
+    | where Application has_any (source_apps)
+    | extend User = tostring(coalesce(AccountDisplayName, AccountObjectId))
+    | extend DlFile = tostring(coalesce(ObjectName, tostring(RawEventData.ObjectName)))
+    | summarize
+        DownloadCount = count(),
+        DownloadStart = min(Timestamp),
+        DownloadEnd = max(Timestamp),
+        DownloadedFrom = make_set(Application, 10),
+        DownloadedFiles = make_set(DlFile, 30)
+        by User, AccountObjectId
+    | where DownloadCount >= min_download_count;
+// --- GenAI uploads per user --------------------------------------------------
+let ai_uploads = CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType has_any (upload_actions)
+    | where Application has_any (genai_apps) or tostring(RawEventData) has_any (genai_domains)
+    | extend User = tostring(coalesce(AccountDisplayName, AccountObjectId))
+    | extend UpFile = tostring(coalesce(ObjectName, tostring(RawEventData.ObjectName)))
+    | summarize
+        UploadCount = count(),
+        UploadStart = min(Timestamp),
+        UploadEnd = max(Timestamp),
+        UploadedTo = make_set(Application, 10),
+        UploadedFiles = make_set(UpFile, 30),
+        UploadIPs = make_set(IPAddress, 10)
+        by User, AccountObjectId;
+// --- Correlate: AI upload that follows a bulk download burst ------------------
+downloads
+| join kind=inner ai_uploads on User, AccountObjectId
+| where UploadStart between (DownloadStart .. (DownloadEnd + correlation_window))
+| extend MinutesFromBulkToUpload = round((UploadStart - DownloadEnd) / 1m, 1)
+| project
+    User, AccountObjectId,
+    DownloadCount, DownloadedFrom, DownloadedFiles, DownloadStart, DownloadEnd,
+    UploadCount, UploadedTo, UploadedFiles, UploadStart, UploadIPs,
+    MinutesFromBulkToUpload
+| order by DownloadCount desc, UploadCount desc
+// =============================================================================
+// OUTPUT: one row per user who pulled a bulk batch of files from a corporate
+// repository and uploaded to a generative AI service within the correlation
+// window. MinutesFromBulkToUpload shows how tight the sequence was. A large
+// DownloadCount followed within minutes by an AI upload is the highest-priority
+// exfiltration signal in this repo. Confirm the files overlap before escalating.
+// =============================================================================

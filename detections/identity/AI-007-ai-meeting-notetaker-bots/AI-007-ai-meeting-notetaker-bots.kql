@@ -1,0 +1,102 @@
+// =============================================================================
+// AI-007: AI Meeting Notetaker and Transcription Bots in Microsoft 365
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     1.0.0
+// Platform:    Microsoft Defender XDR (Advanced Hunting)
+// Table:       CloudAppEvents (Microsoft Teams / Microsoft 365 audit)
+// Sentinel:    See AI-007-ai-meeting-notetaker-bots.yaml for the scheduled
+//              analytics rule version (uses OfficeActivity + TimeGenerated)
+// MITRE:       T1213 (Data from Information Repositories),
+//              T1114 (Email/Communication Collection)
+// =============================================================================
+//
+// PURPOSE
+// Detects AI notetaker and transcription bots operating inside Microsoft 365:
+// Otter, Fireflies, Fathom, Read.ai, tl;dv, Fellow, Sembly, Avoma, Supernormal
+// and similar. These bots join Teams meetings as a participant, or connect via a
+// calendar/mailbox integration, and record, transcribe and store the audio and
+// text of internal conversations on a third-party consumer platform.
+//
+// WHY IT IS A DIFFERENT DETECTION
+// AI-006 catches the OAuth grant at the moment of consent. AI-007 catches the
+// bot in operation: joining meetings and capturing content, including cases
+// where a bot rides in on an EXTERNAL participant's invite rather than an
+// internal grant (a vendor or candidate brings their own notetaker into your
+// meeting). That path never touches your consent logs at all.
+//
+// WHAT THE BOT TAKES
+// The full transcript of a meeting is often more sensitive than any single file:
+// unfiltered discussion of deals, roadmaps, personnel and incidents, verbatim,
+// stored and indexed by a third party, sometimes used to train their models.
+//
+// HOW TO USE
+// 1. Confirm Microsoft Teams / Microsoft 365 audit is connected to Defender for
+//    Cloud Apps so participant and app events land in CloudAppEvents. If not,
+//    deploy the Sentinel YAML, which reads OfficeActivity.
+// 2. Run the README discovery query to find the notetaker display names present
+//    in your tenant, then align the list below.
+// 3. Baseline over 30 days. Approve any sanctioned notetaker, then alert on the
+//    rest. Bots arriving on external invites are the priority.
+//
+// TELEMETRY NOTE
+// Native meeting-participant logging is uneven across tenants and Teams versions.
+// Treat this as a VISIBILITY detection: the first weeks map your real notetaker
+// footprint and feed the policy, rather than producing a finished alert stream.
+//
+// =============================================================================
+
+let lookback = 1h;
+// --- Sanctioned notetakers: EDIT THIS. These display names are suppressed ----
+let approved_notetakers = dynamic([
+    // "Microsoft 365 Copilot"  // example: approved first-party notetaker
+]);
+// --- AI notetaker / transcription bot names (participant + app display names) -
+let notetaker_names = dynamic([
+    "otter", "otter.ai", "fireflies", "fireflies.ai", "fathom",
+    "read.ai", "read ai", "readai", "tl;dv", "tldv", "fellow",
+    "fellow.app", "sembly", "avoma", "supernormal", "krisp",
+    "grain", "fathom notetaker", "notetaker", "note taker",
+    "ai notetaker", "meeting assistant", "meeting bot",
+    "transcription bot", "recorder bot", "sonix", "tactiq",
+    "colibri", "spinach", "vowel", "circleback", "jamie ai"
+]);
+// --- Actions that indicate a bot joined / recorded / transcribed -------------
+let bot_actions = dynamic([
+    "MeetingParticipantDetail", "BotAddedToTeam", "MemberAdded",
+    "AppInstalled", "TeamsAppInstalled", "BotAddedToConversation",
+    "MeetingParticipantJoined", "RecordingStarted", "TranscriptCreated",
+    "TranscriptDownloaded", "MeetingDetail"
+]);
+CloudAppEvents
+| where Timestamp > ago(lookback)
+| where Application in ("Microsoft Teams", "Microsoft 365", "Skype for Business")
+    or ActionType has_any (bot_actions)
+| extend Raw = parse_json(tostring(RawEventData))
+| extend ParticipantName = tostring(coalesce(
+        Raw.Members[0].DisplayName, Raw.AddonName, Raw.AppDistributionMode,
+        Raw.Attendees[0].DisplayName, ObjectName, AccountDisplayName))
+| extend BlobToSearch = tolower(strcat(ParticipantName, " ", tostring(RawEventData)))
+| where BlobToSearch has_any (notetaker_names)
+| where not(BlobToSearch has_any (approved_notetakers))
+| extend Organizer = tostring(coalesce(AccountDisplayName, Raw.Organizer.UserId))
+| extend MeetingId = tostring(coalesce(Raw.MeetingDetail.Id, Raw.CommunicationType, Raw.Id))
+| extend BotName = tostring(ParticipantName)
+| summarize
+    EventCount = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    Bots = make_set(BotName, 15),
+    Actions = make_set(ActionType, 15),
+    Meetings = make_set(MeetingId, 20),
+    SourceIPs = make_set(IPAddress, 10)
+    by Organizer, AccountObjectId
+| extend DistinctBotCount = array_length(Bots)
+| extend DistinctMeetingCount = array_length(Meetings)
+| order by EventCount desc
+// =============================================================================
+// OUTPUT: one row per meeting organizer / account, listing the notetaker bots
+// seen, the actions (joined, recorded, transcribed) and how many meetings were
+// affected. A bot that appears across many meetings, or one that arrived on an
+// external participant's invite, is the result to chase first.
+// =============================================================================

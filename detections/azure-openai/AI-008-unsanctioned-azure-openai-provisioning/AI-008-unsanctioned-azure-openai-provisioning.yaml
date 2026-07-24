@@ -1,0 +1,118 @@
+id: 444c01aa-98dd-479f-a33c-b8b22b252d4c
+name: AI-008 - Unsanctioned Azure OpenAI / Cognitive Services Provisioning
+description: |
+  Detects creation of Azure OpenAI and related Cognitive Services resources, and
+  model deployments on them, outside your approved subscriptions and resource
+  groups. This is shadow AI infrastructure: a team spins up its own Azure OpenAI
+  resource, deploys GPT-class models, and pipes corporate data through an
+  endpoint security never inventoried, with no content-filtering baseline, no
+  diagnostic logging and no data-handling review.
+
+  Enterprise Azure OpenAI is governable, but only for resources you know about.
+  A resource created in an unmonitored subscription is a fully capable LLM
+  endpoint behind your Azure identity with none of the guardrails on the
+  sanctioned one, and it is where an over-privileged or compromised identity
+  would stand up infrastructure for data staging or model abuse.
+
+  Platform note: AzureActivity is an Azure control-plane table, so this ships as
+  a Sentinel rule only (no Defender XDR endpoint variant). Provisioning is a
+  cloud control-plane action, not an endpoint event.
+
+  Recommended tuning: list approved subscription IDs and resource groups so
+  governed infra-as-code deployments are suppressed and only shadow provisioning
+  remains.
+severity: Medium
+status: Available
+requiredDataConnectors:
+  - connectorId: AzureActivity
+    dataTypes:
+      - AzureActivity
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - DefenseEvasion
+  - ResourceDevelopment
+relevantTechniques:
+  - T1578
+  - T1583.006
+query: |
+  let approved_subscription_ids = dynamic([
+      // "00000000-0000-0000-0000-000000000000"  // example: approved AI platform sub
+  ]);
+  let approved_resource_groups = dynamic([
+      // "rg-ai-platform-prod"
+  ]);
+  let provisioning_ops = dynamic([
+      "MICROSOFT.COGNITIVESERVICES/ACCOUNTS/WRITE",
+      "MICROSOFT.COGNITIVESERVICES/ACCOUNTS/DEPLOYMENTS/WRITE",
+      "MICROSOFT.COGNITIVESERVICES/ACCOUNTS/DEPLOYMENTS/ACTION",
+      "MICROSOFT.MACHINELEARNINGSERVICES/WORKSPACES/WRITE",
+      "MICROSOFT.MACHINELEARNINGSERVICES/WORKSPACES/ONLINEENDPOINTS/WRITE"
+  ]);
+  AzureActivity
+  | where ResourceProviderValue in~ ("MICROSOFT.COGNITIVESERVICES", "MICROSOFT.MACHINELEARNINGSERVICES")
+  | where OperationNameValue has_any (provisioning_ops)
+  | where ActivityStatusValue in~ ("Success", "Succeeded", "Accepted", "Started")
+  | where SubscriptionId !in (approved_subscription_ids)
+  | where ResourceGroup !in~ (approved_resource_groups)
+  | extend ResourceKind = tostring(parse_json(tostring(Properties)).resource)
+  | extend CallerName = tostring(coalesce(Caller, tostring(parse_json(tostring(Claims)).name)))
+  | extend IsHumanCaller = iff(CallerName has "@", "Yes", "No")
+  | extend TargetResource = tostring(coalesce(_ResourceId, Resource))
+  | summarize
+      OperationCount = count(),
+      FirstSeen = min(TimeGenerated),
+      LastSeen = max(TimeGenerated),
+      Operations = make_set(OperationNameValue, 15),
+      Resources = make_set(TargetResource, 20),
+      ResourceGroups = make_set(ResourceGroup, 15),
+      Subscriptions = make_set(SubscriptionId, 15),
+      CallerIPs = make_set(CallerIpAddress, 10),
+      HumanCaller = make_set(IsHumanCaller, 3)
+      by CallerName
+  | extend DistinctResourceCount = array_length(Resources)
+  | extend DistinctSubscriptionCount = array_length(Subscriptions)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: CallerName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: CallerIPs
+alertDetailsOverride:
+  alertDisplayNameFormat: 'AI-008: {{CallerName}} provisioned Azure OpenAI resources in an unapproved scope'
+  alertDescriptionFormat: 'Caller {{CallerName}} ran {{OperationCount}} Cognitive Services / OpenAI provisioning operation(s) {{Operations}} on resource(s) {{Resources}} in resource group(s) {{ResourceGroups}}, outside approved subscriptions. Human caller: {{HumanCaller}}. Review for shadow AI infrastructure.'
+customDetails:
+  Operations: Operations
+  Resources: Resources
+  Subscriptions: Subscriptions
+  HumanCaller: HumanCaller
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+suppressionDuration: 5h
+suppressionEnabled: false
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 5h
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+kind: Scheduled
+version: 1.0.0
+metadata:
+  source:
+    kind: Community
+  author:
+    name: BlueRed Security
+  support:
+    tier: Community
+  categories:
+    domains:
+      - Security - Cloud

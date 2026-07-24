@@ -1,0 +1,109 @@
+// =============================================================================
+// AI-006: OAuth Consent Granted to Unsanctioned AI Applications
+// =============================================================================
+// Author:      BlueRed Security (https://uaeblueredsecurity.com)
+// Version:     1.0.0
+// Platform:    Microsoft Defender XDR (Advanced Hunting)
+// Table:       CloudAppEvents (Entra ID / Microsoft 365 audit via Defender)
+// Sentinel:    See AI-006-oauth-consent-ai-apps.yaml for the scheduled
+//              analytics rule version (uses the AuditLogs table + TimeGenerated)
+// MITRE:       T1528 (Steal Application Access Token),
+//              T1098 (Account Manipulation)
+// =============================================================================
+//
+// PURPOSE
+// Detects users granting OAuth consent to third-party AI applications in Entra
+// ID: an AI notetaker, an "AI email assistant", a browser side-panel agent or a
+// ChatGPT-style plugin asking for Graph scopes such as Mail.Read, Files.Read.All
+// or offline_access. This is shadow AI at the identity layer. No file leaves the
+// endpoint, yet the app now holds a standing token to read mailboxes, files or
+// calendars on the user's behalf, with no DLP and no contractual protection.
+//
+// WHY IT IS A DIFFERENT DETECTION
+// AI-001 and AI-005 see network traffic. AI-004 sees file uploads. None of them
+// see an OAuth grant, because a consent is an identity event, not an egress
+// event. Once granted, the app pulls data through the Graph API from Microsoft
+// infrastructure, so the data never crosses the endpoint or the proxy again.
+// Consent phishing and "AI productivity" apps both live here.
+//
+// HOW TO USE
+// 1. Confirm the Entra ID / Azure AD app is connected to Defender for Cloud Apps
+//    so consent events land in CloudAppEvents. If not, deploy the Sentinel YAML,
+//    which reads AuditLogs natively.
+// 2. Baseline over 30 days. Map every result to an app your org already trusts,
+//    then move trusted app IDs into approved_app_ids.
+// 3. Deploy on a 1h schedule. Treat admin consent to a new AI app as higher
+//    severity than a single user consent.
+//
+// NOTE ON COVERAGE
+// The AI app inventory below is name and publisher based and is deliberately
+// broad. Run the discovery query in the README first to see the exact app
+// display names and AppIds present in your tenant, then tighten the lists.
+//
+// =============================================================================
+
+let lookback = 1h;
+// --- Trusted AppIds: EDIT THIS. Consents to these are suppressed -------------
+let approved_app_ids = dynamic([
+    // "11111111-2222-3333-4444-555555555555"  // example: approved Copilot app
+]);
+// --- AI application name / publisher fragments (match on app display name) ---
+let ai_app_names = dynamic([
+    "openai", "chatgpt", "gpt", "anthropic", "claude",
+    "perplexity", "gemini", "bard", "mistral", "deepseek",
+    "copilot", "notion ai", "grammarly", "otter", "fireflies",
+    "fathom", "read.ai", "read ai", "tl;dv", "tldv", "sembly",
+    "jasper", "writesonic", "poe", "character.ai", "huggingface",
+    "hugging face", "cohere", "you.com", "ai assistant", "ai agent",
+    "ai notetaker", "ai note taker", "ai meeting", "ai email",
+    "superhuman ai", "krisp", "supernormal", "avoma", "gong"
+]);
+// --- High-risk delegated / application permissions worth flagging ------------
+let sensitive_scopes = dynamic([
+    "Mail.Read", "Mail.ReadWrite", "Mail.Send",
+    "Files.Read.All", "Files.ReadWrite.All",
+    "Sites.Read.All", "Sites.ReadWrite.All",
+    "Calendars.Read", "Calendars.ReadWrite",
+    "Chat.Read.All", "ChannelMessage.Read.All",
+    "User.Read.All", "Directory.Read.All",
+    "offline_access", "full_access_as_user"
+]);
+CloudAppEvents
+| where Timestamp > ago(lookback)
+| where ActionType in ("Consent to application", "Add delegated permission grant",
+                       "Add app role assignment grant to user", "Add OAuth2PermissionGrant")
+| extend Raw = parse_json(tostring(RawEventData))
+| extend TargetApp = tostring(coalesce(
+        Raw.Target[0].displayName,
+        Raw.ModifiedProperties[0].NewValue,
+        ObjectName))
+| extend AppId = tostring(coalesce(Raw.Target[0].id, Raw.AppId))
+| extend ConsentType = tostring(coalesce(Raw.ConsentContext.ConsentType, Raw.ConsentType))
+| extend GrantedScopes = tostring(coalesce(Raw.ConsentContext.Permissions, Raw.ModifiedProperties))
+| where isnotempty(TargetApp)
+| where tolower(TargetApp) has_any (ai_app_names)
+| where AppId !in (approved_app_ids)
+| extend IsAdminConsent = iff(tolower(ConsentType) has "admin" or tolower(GrantedScopes) has "adminconsent", "Yes", "No")
+| extend TouchesSensitiveScope = iff(GrantedScopes has_any (sensitive_scopes), "Yes", "No")
+| extend User = tostring(coalesce(AccountDisplayName, AccountObjectId, RawEventData.UserId))
+| summarize
+    ConsentCount = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    Apps = make_set(TargetApp, 15),
+    AppIds = make_set(AppId, 15),
+    Actions = make_set(ActionType, 10),
+    Scopes = make_set(GrantedScopes, 10),
+    SourceIPs = make_set(IPAddress, 10),
+    AdminConsent = make_set(IsAdminConsent, 3),
+    SensitiveScope = make_set(TouchesSensitiveScope, 3)
+    by User, AccountObjectId
+| extend DistinctAppCount = array_length(Apps)
+| order by ConsentCount desc
+// =============================================================================
+// OUTPUT: one row per user, listing the AI apps they consented to, the AppIds,
+// whether admin consent was involved and whether any sensitive Graph scope was
+// granted. An admin consent to an unknown AI app that touches Mail.Read or
+// Files.Read.All is the highest-priority result: it grants tenant-wide,
+// standing data access to a third party.
+// =============================================================================
